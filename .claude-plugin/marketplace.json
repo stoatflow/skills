@@ -1,0 +1,26 @@
+{
+  "name": "stoatflow",
+  "owner": {
+    "name": "StoatFlow",
+    "url": "https://stoatflow.io"
+  },
+  "metadata": {
+    "description": "StoatFlow's official skills marketplace.",
+    "version": "1.0.0-beta.3-SNAPSHOT"
+  },
+  "plugins": [
+    {
+      "name": "stoatflow",
+      "source": "./",
+      "description": "StoatFlow AI Assistant Skills — five task-cut skills (build-topology, test, port-from-ks, configure, project-setup) that make AI assistants produce correct StoatFlow code instead of hallucinated Kafka Streams.",
+      "version": "1.0.0-beta.3-SNAPSHOT",
+      "author": {
+        "name": "StoatFlow",
+        "url": "https://stoatflow.io"
+      },
+      "homepage": "https://stoatflow.io/docs/getting-started/ai-assistants",
+      "license": "Apache-2.0",
+      "category": "development"
+    }
+  ]
+}

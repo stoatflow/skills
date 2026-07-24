@@ -1,0 +1,16 @@
+StoatFlow AI Assistant Skills Pack
+Copyright 2026 StoatFlow (Hartmut Armbruster)
+
+This pack — the skills, rules files, distillate, templates, and scripts under this
+directory — is documentation and tooling, licensed to you under the Apache License,
+Version 2.0 (see the LICENSE file).
+
+The StoatFlow software itself is a SEPARATE product and is NOT covered by this
+license. StoatFlow is commercial and closed-source, distributed under the StoatFlow
+Commercial License (https://stoatflow.io/legal/license) and resolved only from the
+private repository https://maven.stoatflow.io with customer credentials. "StoatFlow"
+and related names and logos are trademarks of their owner.
+
+This pack documents the public API surface of StoatFlow so that AI coding assistants
+produce correct StoatFlow code. Nothing here grants any license to the StoatFlow
+software, its engine internals, or its trademarks.
