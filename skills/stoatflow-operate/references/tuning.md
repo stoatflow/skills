@@ -30,12 +30,12 @@ Epoch size (`commit-barrier.max-epoch-records`, default no cap) normally stays u
 
 ## Memory & uncommitted state
 
-- `stoatflow.state.uncommitted-max-bytes` — default 256 MB. A backstop: exceeding it fires an early
+- `stoatflow.state.uncommitted-max-bytes` — default 256 MiB. A backstop: exceeding it fires an early
   `MEMORY_PRESSURE` commit barrier. **Lower it if you see OOMKills.** Rough container budget: 4 GiB → ~1 GiB,
   8 GiB → 1–2 GiB, 16 GiB → 2–4 GiB.
-- `stoatflow.caching.{max-estimated-bytes (256 MB), max-entries (unbounded)}` — per-store cache caps →
+- `stoatflow.caching.{max-estimated-bytes (256 MiB), max-entries (unbounded)}` — per-store cache caps →
   `CACHE_PRESSURE` early commit.
-- `stoatflow.rocks-db.preset` — `LOW_MEMORY` (64 MB) | `DEFAULT` (256 MB) | `HIGH_PERFORMANCE` (1 GB),
+- `stoatflow.rocks-db.preset` — `LOW_MEMORY` (64 MiB) | `DEFAULT` (256 MiB) | `HIGH_PERFORMANCE` (1 GiB),
   shared across all stores. Raise it when the block-cache hit ratio falls while the cache is at capacity.
   RocksDB memory is **bounded by default** — the deliberate difference from Kafka Streams (whose RocksDB is
   unbounded).

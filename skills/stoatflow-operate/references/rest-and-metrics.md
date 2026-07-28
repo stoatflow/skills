@@ -61,6 +61,10 @@ healthy-and-processing), HA (`stoatflow.ha.*`, only when on), and license
 (`stoatflow.license.valid{tier}`). JVM/Kafka-client metrics via `bind-jvm-metrics` (default true). RocksDB
 metrics are opt-in (`stoatflow.rocks-db.metrics.enabled`).
 
+- `stoatflow.dlq.abort.dropped.records` — source records whose outputs were dropped when a broker-side
+  production failure aborted the whole epoch under *continue*. Bounded data loss; any increase is worth
+  an alert. Counts the aborted epoch's offset span (includes the poison record), not dropped outputs.
+
 **Headline alerts:**
 
 - `rate(stoatflow_barrier_failed_total[5m]) > 0` — commit failures (Critical).

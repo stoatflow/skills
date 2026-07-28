@@ -61,8 +61,8 @@ committed-changelog lag ≤ `stoatflow.ha.acceptable-recovery-lag` (default 5000
   cores for I/O-bound; fixed at startup. Decoupled from Kafka partition count.
 - **Commit cadence self-tunes** between `commit-barrier.min-interval-ms` / `max-interval-ms` — you set the
   bounds, not the exact interval. `commit-barrier.timeout-ms` is a safety bound, not a cadence knob.
-- **Memory:** `stoatflow.state.uncommitted-max-bytes` (256 MB — fires an early `MEMORY_PRESSURE` commit);
-  `stoatflow.rocks-db.preset` (`LOW_MEMORY` 64 MB / `DEFAULT` 256 MB / `HIGH_PERFORMANCE` 1 GB).
+- **Memory:** `stoatflow.state.uncommitted-max-bytes` (256 MiB — fires an early `MEMORY_PRESSURE` commit);
+  `stoatflow.rocks-db.preset` (`LOW_MEMORY` 64 MiB / `DEFAULT` 256 MiB / `HIGH_PERFORMANCE` 1 GiB).
 
 ## Metrics & alerts (details in references/rest-and-metrics.md)
 

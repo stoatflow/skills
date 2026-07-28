@@ -49,9 +49,9 @@ runtime:
 - **`stoatflow.commit-barrier`** — self-tuning barrier cadence: `interval-ms` (500 seed),
   `min-interval-ms`/`max-interval-ms` (150/5000), `timeout-ms` (60000; **must be > interval-ms**; cascades
   to producer `transaction.timeout.ms`/`max.block.ms`/`delivery.timeout.ms`). Plus EMA/epoch-sizing knobs.
-- **`stoatflow.state`** + **`stoatflow.rocks-db`** — `state.dir`, `state.uncommitted-max-bytes` (256 MB —
+- **`stoatflow.state`** + **`stoatflow.rocks-db`** — `state.dir`, `state.uncommitted-max-bytes` (256 MiB —
   bounded by default, the deliberate difference from KS's unbounded RocksDB), `rocks-db.preset`
-  (`LOW_MEMORY` 64 MB / `DEFAULT` 256 MB / `HIGH_PERFORMANCE` 1 GB), `rocks-db.backend` (`AUTO`/`FFM`/`JNI`),
+  (`LOW_MEMORY` 64 MiB / `DEFAULT` 256 MiB / `HIGH_PERFORMANCE` 1 GiB), `rocks-db.backend` (`AUTO`/`FFM`/`JNI`),
   `rocks-db.metrics`.
 - **`stoatflow.changelog`** — `enabled`, `replication-factor` (-1 = broker default), `num-partitions` (1).
 - **`stoatflow.watermark`** — `max-out-of-orderness-ms` (10000), `idleness-timeout-ms`, `auto-interval-ms`.

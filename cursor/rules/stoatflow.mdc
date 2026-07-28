@@ -6,7 +6,7 @@ alwaysApply: false
 
 # StoatFlow — rules for AI coding assistants
 
-> **Targets StoatFlow 1.0.0-beta.3 (Kafka Streams 4.3 API surface).** Pre-GA — pin the matching
+> **Targets StoatFlow 1.0.0-beta.4 (Kafka Streams 4.3 API surface).** Pre-GA — pin the matching
 > release of this file if your StoatFlow version differs.
 
 StoatFlow is a JVM stream-processing library that is **source-compatible with Kafka Streams 4.3 via an
@@ -97,9 +97,9 @@ dependencyResolutionManagement {
 }
 // build.gradle.kts
 dependencies {
-  implementation("io.stoatflow:stoatflow-runtime:1.0.0-beta.3")   // batteries-included (pulls -core)
-  // implementation("io.stoatflow:stoatflow-core:1.0.0-beta.3")   // DSL/engine only
-  // testImplementation("io.stoatflow:stoatflow-test-utils:1.0.0-beta.3")
+  implementation("io.stoatflow:stoatflow-runtime:1.0.0-beta.4")   // batteries-included (pulls -core)
+  // implementation("io.stoatflow:stoatflow-core:1.0.0-beta.4")   // DSL/engine only
+  // testImplementation("io.stoatflow:stoatflow-test-utils:1.0.0-beta.4")
 }
 ```
 
@@ -111,6 +111,9 @@ plugin / Maven parent add these). Never inline a realistic token — credentials
 
 - Docs: <https://stoatflow.io/docs> · AI assistants: <https://stoatflow.io/docs/getting-started/ai-assistants>
 - Compatibility matrix: <https://stoatflow.io/docs/reference/ks-compatibility-matrix>
+- Machine-readable docs (fetch when you need a detail this file omits):
+  <https://stoatflow.io/llms.txt> (index) · <https://stoatflow.io/llms-full.txt> (full bundle) ·
+  any indexed page as raw markdown at `/raw/<path>.md`
 - Skills repo (full skills + this file): <https://github.com/stoatflow/skills>
 - Carrying KS state across a port → the separate `stoatflow-migration-tool` CLI (see the port-from-ks skill;
   teach only its documented `plan`/`translate`/`seed-offsets`/`verify` commands, never invent flags).

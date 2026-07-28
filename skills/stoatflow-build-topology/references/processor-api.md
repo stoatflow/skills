@@ -56,6 +56,32 @@ Handle in `onTimer(timestamp, key, TimerContext)` — `TimerContext` gives `forw
 `getStateStore(name)` (read/write), `timerService()`, `timestamp()`, `timeDomain()`. Timers dedup by
 `(key, timestamp)` and fire exactly once; persistent backend survives restart.
 
+## Processor wrapping (KIP-1112 `processor.wrapper.class`)
+
+One configured `ProcessorWrapper` decorates **every** node of the topology — DSL operators *and* Processor-API
+nodes — at topology-compile time. The surface is the KS one: `wrapProcessorSupplier(name, supplier)` /
+`wrapFixedKeyProcessorSupplier(name, supplier)`, the markers `WrappedProcessorSupplier` /
+`WrappedFixedKeyProcessorSupplier`, the statics `ProcessorWrapper.asWrapped(...)` / `.asWrappedFixedKey(...)`,
+and a `configure(Map)` default invoked once at instantiation. Default `NoOpProcessorWrapper` (pass-through).
+
+Wire it the KS way (portable) — `new StreamsBuilder(new TopologyConfig(config))` / `new Topology(topologyConfig)`
+— or just set `processor.wrapper.class` on the runtime config: **StoatFlow honours that too** (KS silently
+ignores it as "too late"). `TopologyConfig` wins on conflict, with a WARN.
+
+What a wrapper can do, by node kind:
+
+| Node | Capability |
+|---|---|
+| Your PAPI nodes (`process`/`processValues`/`addProcessor`) | decorate, **replace**, add stores via the wrapped supplier's `stores()` |
+| DSL operator nodes | **record path only** — observe / decorate / short-circuit; a decorator's record rewrite (`record.withTimestamp(...)` / `withHeaders(...)`) flows through to the operator, downstream nodes, and the sink. Replacement is rejected at build time (`TopologyValidationException` naming the node), as is declaring `stores()` for one |
+| `init`/watermark/suppress-flush/restore callbacks on DSL nodes | not routed through the wrapper; a DSL-node decorator's context also cannot `schedule()` / `timerService()` (both throw). `onTimer` is NOT bypassed — keyed timers exist only on Processor-API nodes, which Layer 1 wraps in full |
+| `addGlobalStore` / `addReadOnlyStateStore` state-update suppliers, engine-synthetic nodes | not wrapped (KS parity) |
+
+Two gotchas: the returned supplier's **`get()` runs once per lane** (not once per task), so decorator instance
+fields are lane-scoped — put cross-lane aggregation on the thread-safe wrapper object; and **node names are
+StoatFlow's** (`mapValues-0`, `process-0`, your `Named`), not KS's `KSTREAM-…-0000000001`, so a ported
+name-matching wrapper compiles and matches nothing. Zero overhead when the key is unset.
+
 ## Scheduled sources (🆕 no KS equivalent)
 
 `StreamsBuilder.scheduled(...)` → `KStream<K,V>` — periodically generates records without consuming from

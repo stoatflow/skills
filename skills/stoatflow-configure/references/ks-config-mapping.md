@@ -19,6 +19,17 @@ StoatFlow keeps a **typed** config model (`StreamsConfig` data class + `Builder`
   WARN and are ignored) / *unknown* (WARN). Opt-in **`stoatflow.config.strict`** throws only on
   truly-unknown keys. Default is lenient — unknown keys warn, don't fail.
 
+- **`processor.wrapper.class` (KIP-1112)** is supported (ADR-118 Batch-14): the named
+  `io.stoatflow.core.processor.ProcessorWrapper` is instantiated at ingestion and handed the raw config map
+  via `configure(...)`, then wraps **every** topology node at compile time. Either no-op FQCN — KS's
+  `org.apache.kafka.streams.processor.internals.NoOpProcessorWrapper` or StoatFlow's
+  `io.stoatflow.core.processor.NoOpProcessorWrapper` — counts as "unset". 🆕 Unlike KS, it is honoured even
+  when set only on the runtime config (KS requires a `TopologyConfig` and silently ignores it otherwise); a
+  `TopologyConfig`-provided wrapper wins on conflict, with a WARN when the classes differ. Typed equivalent:
+  `Builder.processorWrapper(wrapper)` or `Builder.processorWrapperClassName(className)` (the latter calls
+  `configure(emptyMap())`; it is a separately named method so the Java call `processorWrapper(null)` stays
+  unambiguous). Caveats live in the `stoatflow-build-topology` processor-API reference.
+
 So a ported KS `Properties` usually needs **no change**; for StoatFlow-only engine knobs use the typed
 `Builder` or `application.yaml`.
 
