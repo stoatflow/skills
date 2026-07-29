@@ -1,7 +1,7 @@
 {
   "name": "stoatflow",
   "description": "StoatFlow AI Assistant Skills — teach your assistant to write correct StoatFlow code. StoatFlow is source-compatible with Kafka Streams 4.3 via an import swap, but it is NOT Kafka Streams; this pack overrides the wrong Kafka-Streams priors (import root, EXACTLY_ONCE default, single-instance scaling, private Maven repo, watermark semantics).",
-  "version": "1.0.0-beta.4",
+  "version": "1.0.0-beta.5",
   "author": {
     "name": "StoatFlow",
     "url": "https://stoatflow.io"

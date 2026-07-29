@@ -52,7 +52,16 @@ runtime:
 - **`stoatflow.state`** + **`stoatflow.rocks-db`** — `state.dir`, `state.uncommitted-max-bytes` (256 MiB —
   bounded by default, the deliberate difference from KS's unbounded RocksDB), `rocks-db.preset`
   (`LOW_MEMORY` 64 MiB / `DEFAULT` 256 MiB / `HIGH_PERFORMANCE` 1 GiB), `rocks-db.backend` (`AUTO`/`FFM`/`JNI`),
-  `rocks-db.metrics`.
+  `rocks-db.metrics`, `state.format-downgrade` (`refuse` default | `wipe-and-restore` — see below).
+- **`stoatflow.dsl`** — `store-format` (`DEFAULT` | `HEADERS`): the global default for whether DSL
+  aggregations persist the processing record's `Headers` (KIP-1271/1285). Per-store
+  `Materialized.withRecordHeaders()` / `withoutRecordHeaders()` always wins. Turning headers **on** is a
+  free lazy in-place upgrade; turning them **off** over a store that already carries them is a *declared
+  format change* — startup refuses with an actionable message unless you set
+  `state.format-downgrade: wipe-and-restore` (which rebuilds that store from its changelog: one full
+  restore). An empty headers keyspace is dropped in place for free; a store with no recovery source
+  (`withLoggingDisabled()`, or the changelog globally off) is refused regardless. A downgrade sheds
+  persisted headers, and re-enabling headers does **not** bring them back.
 - **`stoatflow.changelog`** — `enabled`, `replication-factor` (-1 = broker default), `num-partitions` (1).
 - **`stoatflow.watermark`** — `max-out-of-orderness-ms` (10000), `idleness-timeout-ms`, `auto-interval-ms`.
 - **`stoatflow.ha`** — `mode` (`off` default | `active-standby`), `acceptable-recovery-lag`,

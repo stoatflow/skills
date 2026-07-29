@@ -38,6 +38,17 @@ Store builders: `Stores.keyValueStoreBuilder(supplier, keySerde, valueSerde)` (+
 `.withLoggingDisabled()`, `.withRecordHeaders()` (KIP-1271). Store-type precedence (ADR-029): `withStoreType`
 > explicit supplier > RocksDB default.
 
+**`.withRecordHeaders()` is close to a one-way door.** Turning it *on* is free — a lazy in-place upgrade,
+no pause, no rewrite. Turning it *off* again over a store that has already migrated data is a **declared
+format change**: startup refuses with a `StoreFormatDowngradeException` until the operator sets
+`stoatflow.state.format-downgrade: wipe-and-restore`, which deletes that store's local state and rebuilds
+it from the changelog. It is refused **unconditionally** — no acknowledgement available — when the store
+has no recovery source (`withLoggingDisabled()`, or the global changelog off). Only the case where nothing
+was ever written in headers mode is free. And the round trip is lossy: a downgrade sheds persisted
+headers, and re-enabling converts the legacy values back with *empty* headers. Kafka Streams refuses the
+same downgrade; the acknowledgement key is StoatFlow's addition. See `stoatflow-operate` for the
+operational side.
+
 Store handles: `KeyValueStore<K,V>` (`get`/`put`/`delete`, atomic `compute(key, fn)` / `merge(key, value, fn)`);
 read-only `ReadOnlyKeyValueStore` (`get`, `containsKey`, `all`/`reverseAll`, `range`/`reverseRange`,
 `prefixScan(prefix, serializer)`, `approximateNumEntries`); `KeyValueIterator` is `Closeable`.

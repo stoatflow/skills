@@ -64,6 +64,35 @@ committed-changelog lag ≤ `stoatflow.ha.acceptable-recovery-lag` (default 5000
 - **Memory:** `stoatflow.state.uncommitted-max-bytes` (256 MiB — fires an early `MEMORY_PRESSURE` commit);
   `stoatflow.rocks-db.preset` (`LOW_MEMORY` 64 MiB / `DEFAULT` 256 MiB / `HIGH_PERFORMANCE` 1 GiB).
 
+## Store-format downgrade (record headers turned off)
+
+If a deploy removes `withRecordHeaders()` (or flips `stoatflow.dsl.store-format` back to `DEFAULT`) over a
+store that already persists headers, **startup refuses** with a `StoreFormatDowngradeException`. This is
+deliberate, not a bug: the on-disk keyspace exists and RocksDB cannot open the database without naming it,
+so StoatFlow classifies it before the store opens and reports it instead of dying on a raw RocksDB error.
+Nothing on disk is touched, so an accidental flag removal costs a restart, never data.
+
+Three remedies, in the order most operators want them:
+
+1. **Re-enable record headers** and restart — instant, nothing is rewritten.
+2. **Acknowledge:** `stoatflow.state.format-downgrade: wipe-and-restore`. That store's local state is
+   deleted and rebuilt from its changelog — one full restore, bounded by changelog size, on the startup
+   critical path. Budget for it, and see `references/tuning.md` for making restoration fast.
+3. **Reset the local state yourself** — `cleanUp()`, or delete the store directory.
+
+Two cases never reach the setting: an **empty** headers keyspace (the flag was flipped on and off with
+nothing written) is dropped in place for free, and a store with **no recovery source** (per-store
+`withLoggingDisabled()`, or the changelog globally disabled) is refused unconditionally — remedy 2 does not
+apply, because there is nothing to rebuild from.
+
+**The round trip is lossy.** A downgrade sheds persisted headers from the local store, and re-enabling
+headers later upgrades *lazily* — legacy values convert with empty headers — so they do not come back
+without a forced full restore. Kafka Streams behaves the same way (it refuses outright; the acknowledgment
+key is StoatFlow's addition). Watch
+`stoatflow_store_format_downgrade_total{outcome="dropped-empty"|"wiped"}`. The `refused` outcome is
+counted too, but startup fails immediately after, so a scrape will not catch it — detect a refusal from the
+crash-loop and the log line, not from this metric.
+
 ## Metrics & alerts (details in references/rest-and-metrics.md)
 
 `GET /metrics` (Prometheus). `runtime.metrics.naming: stoatflow | kafka-streams | both` — use `both` to

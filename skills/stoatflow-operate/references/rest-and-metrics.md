@@ -58,12 +58,28 @@ Main metric families (level `info`): throughput/latency (`stoatflow.lane.records
 (`stoatflow.restoration.{in.progress,records.restored.total}`), consumer/producer
 (`stoatflow.consumer.lag.records`), client state (`stoatflow.client.state` — ordinal, `== 4` = RUNNING =
 healthy-and-processing), HA (`stoatflow.ha.*`, only when on), and license
-(`stoatflow.license.valid{tier}`). JVM/Kafka-client metrics via `bind-jvm-metrics` (default true). RocksDB
-metrics are opt-in (`stoatflow.rocks-db.metrics.enabled`).
+(`stoatflow.license.valid{tier}`). JVM/Kafka-client metrics via `bind-jvm-metrics` (default true).
+
+**RocksDB (`stoatflow.rocksdb.*`) is opt-in and two-gated:** `stoatflow.rocks-db.metrics.enabled: true`
+gives the property + cache gauges (`info`, cheap); adding `statistics-enabled: true` gives the ticker /
+ratio / histogram meters (`debug`, ~5–10% write-path cost, applied at store open so it needs a restart).
+~43 series **per store** plus 3 global. The ones worth a dashboard: `background.errors` (alert on any
+non-zero), `estimate.pending.compaction.bytes` (climbing = compaction losing ground),
+`write.stall.duration.{avg,total}.ms` (RocksDB backpressuring the commit path),
+`block.cache.{,data.,index.,filter.}hit.ratio`, `{total,live}.sst.files.size.bytes`, `estimate.num.keys`
+(the RocksDB counterpart of `store.num.keys`, which covers in-memory stores only), and the three global
+`shared.block.cache.{capacity,usage,pinned.usage}.bytes` — StoatFlow runs one LRU cache across all
+stores, so prefer those over the per-store duplicates that exist for KS-dashboard portability. Two
+caveats: `open.files` is not published (its RocksDB ticker is gone in the bundled RocksJava), and
+`*.min.ms` is JNI-only (the default FFM backend's statistics dump has no MIN token).
 
 - `stoatflow.dlq.abort.dropped.records` — source records whose outputs were dropped when a broker-side
   production failure aborted the whole epoch under *continue*. Bounded data loss; any increase is worth
   an alert. Counts the aborted epoch's offset span (includes the poison record), not dropped outputs.
+- `stoatflow.dropped.records.total{reason}` — six reasons: `null_key`, `late_window`, `late_session`,
+  `join_null_key`, `join_null_value`, `table_source_null_key`. The tag *is* the semantics — always group
+  by it rather than alerting on the bare total.
+- Store operation latency is `stoatflow.store.{get,put,delete,range,all,flush}.latency` (all `debug`).
 
 **Headline alerts:**
 
