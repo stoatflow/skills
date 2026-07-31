@@ -51,7 +51,11 @@ operational side.
 
 Store handles: `KeyValueStore<K,V>` (`get`/`put`/`delete`, atomic `compute(key, fn)` / `merge(key, value, fn)`);
 read-only `ReadOnlyKeyValueStore` (`get`, `containsKey`, `all`/`reverseAll`, `range`/`reverseRange`,
-`prefixScan(prefix, serializer)`, `approximateNumEntries`); `KeyValueIterator` is `Closeable`.
+`prefixScan(prefix, serializer)`, `approximateNumEntries`); `KeyValueIterator` is `Closeable`. Range bounds
+are KS-exact (KIP-763): a null bound is open-ended (both null ≡ `all()`), `reverseRange` takes ascending
+`(low, high)` bounds like `range`, and `from > to` (on the serialized key bytes) yields an empty iterator +
+WARN — the same rules apply to the window/session key-range queries (`fetch(keyFrom, keyTo, …)`,
+`findSessions(keyFrom, keyTo, …)`).
 
 **Notes:** RocksDB is default/recommended; in-memory still writes a changelog (durable via replay) unless
 `withLoggingDisabled()` (then unrecoverable after a crash). Caching only affects downstream *emissions*
