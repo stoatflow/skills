@@ -67,8 +67,8 @@ runtime:
 - **`stoatflow.ha`** — `mode` (`off` default | `active-standby`), `acceptable-recovery-lag`,
   `desired-standbys`/`max-standbys`, `failover-priority`, coordination/heartbeat knobs (see
   `stoatflow-operate`).
-- **`stoatflow.kafka.{consumer,producer,restoration-consumer}`** — freeform client passthrough (Layer 3 of
-  the 4-layer merge); see `references/ks-config-mapping.md`.
+- **`stoatflow.kafka.{consumer,producer,restoration-consumer,admin}`** — freeform client passthrough (the
+  user-override layer of each client's merge; see `references/ks-config-mapping.md` for the per-client layers); see `references/ks-config-mapping.md`.
 - **`stoatflow.license`** — `key`/`file`/`environment`/`cache-dir`/`verbose-banner` (see
   `stoatflow-project-setup` for how the key is supplied).
 - **`runtime.*`** — `http` (port 8080, `debug`), `metrics` (`prefix` `stoatflow`, `naming`

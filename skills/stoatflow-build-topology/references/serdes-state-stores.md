@@ -6,6 +6,19 @@ StoatFlow uses standard Kafka `org.apache.kafka.common.serialization.Serde<T>` /
 StoatFlow type. Resolution: explicit serde on the operator config (`Consumed`/`Produced`/`Grouped`/
 `Materialized`) wins; else the runtime default; else startup fails.
 
+- **Boundary key serdes** (StoatFlow-specific, no KS equivalent): where a re-keyed record reaches an
+  operator that needs the new key's lane affinity — a grouped aggregation, any join, `toTable()`,
+  `process()`/`processValues()`, or an explicit `repartition()` — the new key is serialized in-memory for
+  lane-assignment hashing at that sub-topology boundary. A re-key alone does **not** open one
+  (`selectKey → mapValues → to()` is a single sub-topology; ADR-138, `topology.sub-topology-split: lazy`
+  is the default), so such a topology needs no boundary key serde at all. The serde resolves from any declaration for THAT key — upstream
+  first (`Consumed`, a `Repartitioned` flowed through), then downstream (`Repartitioned`, `Grouped`, a
+  sink's `Produced`, an aggregation's `Materialized.withKeySerde`), else the configured default. A
+  declaration only counts for the key it describes: adjacent re-keys resolve to the default, a `Grouped`
+  serde never answers for the key ARRIVING at its `groupBy`, and two conflicting declarations fall back
+  to the default. Unresolved boundaries WARN at startup naming the `'parent' → 'child'` edge and fail on
+  the first record with `LaneKeySerializationException` if keys are not raw bytes.
+
 - Defaults in code: `streamsConfigOverrides { defaultKeySerde(...); defaultValueSerde(...) }`; or YAML
   `stoatflow.default-key-serde` / `default-value-serde` (FQ class name, no-arg ctor only). Code wins.
 - Built-ins: `Serdes.String()/Long()/Integer()/Short()/Float()/Double()/ByteArray()/ByteBuffer()/Bytes()/UUID()/Void()`.

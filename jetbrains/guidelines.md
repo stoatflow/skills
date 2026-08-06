@@ -1,6 +1,6 @@
 # StoatFlow — rules for AI coding assistants
 
-> **Targets StoatFlow 1.0.0-beta.6 (Kafka Streams 4.3 API surface).** Pre-GA — pin the matching
+> **Targets StoatFlow 1.0.0-beta.7 (Kafka Streams 4.3 API surface).** Pre-GA — pin the matching
 > release of this file if your StoatFlow version differs.
 
 StoatFlow is a JVM stream-processing library that is **source-compatible with Kafka Streams 4.3 via an
@@ -91,9 +91,9 @@ dependencyResolutionManagement {
 }
 // build.gradle.kts
 dependencies {
-  implementation("io.stoatflow:stoatflow-runtime:1.0.0-beta.6")   // batteries-included (pulls -core)
-  // implementation("io.stoatflow:stoatflow-core:1.0.0-beta.6")   // DSL/engine only
-  // testImplementation("io.stoatflow:stoatflow-test-utils:1.0.0-beta.6")
+  implementation("io.stoatflow:stoatflow-runtime:1.0.0-beta.7")   // batteries-included (pulls -core)
+  // implementation("io.stoatflow:stoatflow-core:1.0.0-beta.7")   // DSL/engine only
+  // testImplementation("io.stoatflow:stoatflow-test-utils:1.0.0-beta.7")
 }
 ```
 

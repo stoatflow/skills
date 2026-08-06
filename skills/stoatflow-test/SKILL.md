@@ -92,6 +92,15 @@ The TTD is a **fidelity approximation**, not the engine:
 - **In-memory only.** All stores (even RocksDB-`Materialized`) run as in-memory twins; **no changelog** is
   written. Changelog/restoration, **EOS transactional commits**, and cross-key/lane ordering are
   **structurally invisible** to the TTD — test those with a real broker.
+- **Boundary key serialization IS reproduced** (record path AND window-close/suppress/punctuator
+  emissions): a key crossing a sub-topology boundary — where a re-keyed record reaches an aggregation,
+  a join, `toTable()`, `process()`/`processValues()`, or an explicit `repartition()` (ADR-138; a re-key
+  alone opens no boundary) — is
+  serialized with the same resolved boundary serde as production, so an unresolvable re-keyed boundary
+  raises `LaneKeySerializationException` in the test instead of only in production. If a previously-green
+  test starts failing with it, the topology genuinely declares no serde for that re-keyed key — declare
+  one (`Repartitioned`/`Grouped`/`Produced`/`Materialized`) or set the default key serde the app itself
+  uses.
 
 ## Config-driven tests (StoatFlowTestDriver)
 

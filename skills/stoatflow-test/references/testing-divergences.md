@@ -7,7 +7,13 @@ porting register.
 ## KSC-62 — serdes are enforced at the source/sink boundary
 
 The TTD **applies** the `createInputTopic`/`createOutputTopic` serdes and round-trips records through them,
-exactly as the real engine deserializes at the source and serializes at the sink. (It used to run in
+exactly as the real engine deserializes at the source and serializes at the sink — and, since bugfix
+20260803/20260804, also serializes keys crossing **sub-topology boundaries** — which, since ADR-138, open
+only where a re-keyed record reaches an operator needing key affinity (aggregation, join, `toTable()`,
+`process()`/`processValues()`) or an explicit `repartition()`, not at every re-key — with the same
+resolved boundary serde on the record path AND the window-close/suppress/punctuator emission path, so an
+unresolvable re-keyed boundary raises `LaneKeySerializationException` in the test as in production. (It
+used to run in
 "object mode" — passing typed objects straight through, ignoring the serdes.)
 
 - **A correctly-typed KS test needs no change** — it already declares serdes via `Consumed.with` /

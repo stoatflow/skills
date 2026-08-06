@@ -68,6 +68,15 @@ stream.mapValues { v -> v.length }.to("output-b")          // branch 2
 
 - **Default guarantee is `EXACTLY_ONCE`** — output, changelog, and offsets commit atomically on the commit
   barrier. Don't assume at-least-once behavior. (Set `at_least_once` in config if you need it.)
+- **A re-key does NOT create a sub-topology by itself** (ADR-138, default
+  `topology.sub-topology-split: lazy`). StoatFlow opens an in-memory repartition boundary only where a
+  re-keyed record reaches an operator that needs the new key's lane affinity — a grouped aggregation, any
+  join, `toTable()`, `process()`/`processValues()` — or at an explicit `repartition()`. This matches
+  Kafka Streams' rule for materialising a repartition topic, with one deliberate difference: KS never
+  repartitions before a Processor API node, StoatFlow does. **Consequence for advice you give:** if a user
+  relies on a re-key to spread work across lanes (skewed or low-cardinality source keys feeding an
+  expensive operator), tell them to insert an explicit `repartition()` — the same idiom as in KS. Genuinely
+  null keys are round-robined across lanes, so they are unaffected; an empty non-null key is not.
 - **Scale with lanes, not partitions/replicas** — parallelism is `stoatflow.lanes.count` (≈ CPU × 4), a
   virtual-partition count independent of the topic's Kafka partitions. Never suggest `replicas: N`.
 - **Handle `null` values (tombstones)** — mappers/predicates/foreach receive `null` values on KTable

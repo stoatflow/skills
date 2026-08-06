@@ -40,6 +40,13 @@ scrape_configs:
 Or Kubernetes pod annotations `prometheus.io/scrape: "true"`, `prometheus.io/path: "/metrics"`,
 `prometheus.io/port: "8080"` (or a `ServiceMonitor`).
 
+**Sub-topology ids shifted in 1.0.0 (ADR-138).** Boundaries now open only where an operator needs a re-keyed
+record's lane affinity, not at every key change — so re-keying topologies have **fewer** sub-topologies and the
+ids renumber. Any dashboard, alert or recording rule pinning a `sub_topology` / `subtopology_id` value, or a
+`lane_id=~"N_.*"` regex (lane ids are `{subtopology}_{lane}`), needs re-checking against a live scrape after an
+upgrade. Thread names (`stoatflow-{chain}-st{N}-lane-{L}`) and `/topology*` shift the same way.
+`stoatflow.topology.sub-topology-split: eager` restores the old numbering.
+
 **Naming modes** — use `both` to light up existing Kafka Streams dashboards during a migration:
 
 ```yaml
