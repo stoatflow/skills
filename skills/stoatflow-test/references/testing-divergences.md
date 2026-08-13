@@ -9,12 +9,28 @@ porting register.
 The TTD **applies** the `createInputTopic`/`createOutputTopic` serdes and round-trips records through them,
 exactly as the real engine deserializes at the source and serializes at the sink — and, since bugfix
 20260803/20260804, also serializes keys crossing **sub-topology boundaries** — which, since ADR-138, open
-only where a re-keyed record reaches an operator needing key affinity (aggregation, join, `toTable()`,
-`process()`/`processValues()`) or an explicit `repartition()`, not at every re-key — with the same
+only where a re-keyed record reaches an operator needing key affinity (aggregation, join, `toTable()`)
+or an explicit `repartition()`, not at every re-key, and since 1.0.0 **not** at `process()` /
+`processValues()` either (`topology.processor-api-key-affinity` defaults to `off`) — with the same
 resolved boundary serde on the record path AND the window-close/suppress/punctuator emission path, so an
 unresolvable re-keyed boundary raises `LaneKeySerializationException` in the test as in production. (It
 used to run in
-"object mode" — passing typed objects straight through, ignoring the serdes.)
+"object mode" — passing typed objects straight through, ignoring the serdes.) Since the boundary serde
+gained a last-resort step — inheriting the nearest declaration from before the re-key, when
+`default.key.serde` was never configured — that exception is reached less often; it still fires when the
+re-key changes the key *type*, because the inherited serde then cannot encode the new key.
+
+- **`topology.validation.<rule-id>` is `TopologyTestDriver`-visible.** The rules are raised at
+  topology-compile time, not at engine start, so a rule set to `error` fails driver construction with no
+  broker — naming every offending site in one message. A rule at `warn` reaches the driver too: the
+  line is logged as the driver builds the topology, so a suite that was silent about a
+  boundary can start warning about it with no topology change.
+  **Severities are per rule and one defaults to `error`** — `papi-key-affinity-presumed` (a re-key
+  feeding a Processor API node with a writable store). Its sibling `papi-key-affinity-presumed-chain`
+  (the feeder is itself a Processor API node, so the re-key is only presumed) and the two boundary-serde
+  rules default to `warn`. A previously-green KS-ported suite CAN start failing at driver construction
+  because of this; the fix is `repartition()`, `topology.processor-api-key-affinity: presumed`, or
+  re-keying the store — not silencing the rule without reading it.
 
 - **A correctly-typed KS test needs no change** — it already declares serdes via `Consumed.with` /
   `Produced.with` / `Materialized` or KS `Properties` default serdes (`DEFAULT_{KEY,VALUE}_SERDE_CLASS_CONFIG`).

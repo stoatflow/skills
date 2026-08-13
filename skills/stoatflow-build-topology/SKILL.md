@@ -71,12 +71,29 @@ stream.mapValues { v -> v.length }.to("output-b")          // branch 2
 - **A re-key does NOT create a sub-topology by itself** (ADR-138, default
   `topology.sub-topology-split: lazy`). StoatFlow opens an in-memory repartition boundary only where a
   re-keyed record reaches an operator that needs the new key's lane affinity — a grouped aggregation, any
-  join, `toTable()`, `process()`/`processValues()` — or at an explicit `repartition()`. This matches
-  Kafka Streams' rule for materialising a repartition topic, with one deliberate difference: KS never
-  repartitions before a Processor API node, StoatFlow does. **Consequence for advice you give:** if a user
-  relies on a re-key to spread work across lanes (skewed or low-cardinality source keys feeding an
-  expensive operator), tell them to insert an explicit `repartition()` — the same idiom as in KS. Genuinely
-  null keys are round-robined across lanes, so they are unaffected; an empty non-null key is not.
+  join, `toTable()` — or at an explicit `repartition()`. This matches Kafka Streams' rule for
+  materialising a repartition topic. **Consequence for advice you give:** if a user relies on a re-key to
+  spread work across lanes (skewed or low-cardinality source keys feeding an expensive operator), tell
+  them to insert an explicit `repartition()` — the same idiom as in KS. Genuinely null keys are
+  round-robined across lanes, so they are unaffected; an empty non-null key is not.
+- **`process()` / `processValues()` do NOT get key affinity after a re-key** (since 1.0.0, default
+  `topology.processor-api-key-affinity: off`). This matches Kafka Streams, which never repartitions
+  before a Processor API node even when it has connected stores. **Consequence for advice you give:**
+  after a **many-to-one** re-key (several old keys collapsing onto one new key), two records with the
+  same new key can be processed concurrently on different lanes, so per-key state in that node is not
+  serialized. A store read-modify-write in that shape can lose an update, and neither `compute()` nor a
+  lock closes the window. StoatFlow **refuses to compile** the provable case — a **proven** re-key
+  (`selectKey`/`map`/`groupBy`/…) feeding a Processor API node that connects a **writable** store —
+  with the `papi-key-affinity-presumed` validation rule (read-only KIP-813 stores are excluded). Where
+  the feeder is itself a Processor API node, the re-key is only *presumed* — `process()` and
+  `addProcessor()` declare a key change unconditionally — so a plain `process(a).process(b + store)`
+  chain **warns** via `papi-key-affinity-presumed-chain` rather than failing. Never tell a user that
+  chained processors fail the build; they do not, and Kafka Streams runs them too. The three
+  remedies, in order: insert `repartition()` before the node (in StoatFlow that is an **in-memory**
+  boundary, not a Kafka topic — never advise avoiding it on cost grounds); set
+  `topology.processor-api-key-affinity: presumed` to restore the boundary everywhere; or stop keying the
+  store by the post-re-key key. An **injective** (1:1) re-key is safe with no boundary — StoatFlow lanes
+  by the *old* key — and a node that declares a timer keeps its boundary regardless.
 - **Scale with lanes, not partitions/replicas** — parallelism is `stoatflow.lanes.count` (≈ CPU × 4), a
   virtual-partition count independent of the topic's Kafka partitions. Never suggest `replicas: N`.
 - **Handle `null` values (tombstones)** — mappers/predicates/foreach receive `null` values on KTable

@@ -13,6 +13,45 @@ Interfaces are `io.stoatflow.core.processor.*`.
   every call** (the engine creates one per key-affinity lane); `stores()` (default empty) declares
   `Set<StateStoreBuilder<*>>`.
 
+### Key affinity after a re-key (read before advising on per-key state)
+
+Since 1.0.0 a Processor API node does **not**, by itself, require key affinity
+(`topology.processor-api-key-affinity: off`) — matching Kafka Streams, which never repartitions before
+`process()` / `processValues()` even with connected stores.
+
+- **Injective (1:1) re-key, or no re-key**: nothing changes. StoatFlow lanes by the *old* key, so
+  affinity is preserved for free.
+- **Many-to-one re-key** (several old keys collapsing onto one new key): records reach the node on the
+  lane of their *old* key, so two records with the same new key run concurrently on different lanes.
+  Per-key state is then **fragmented across lanes** — instance fields stay race-free (one instance per
+  lane, as in a KS task) but a given key's state lives in several of them, and a store
+  read-modify-write can lose an update across a commit barrier. Neither `compute()` nor a
+  `KeyLockManager` lock closes that window.
+- A node that **declares a timer** (`declaredTimerTypes()` non-empty) keeps its boundary either way —
+  the timer service hashes the *new* key while records lane by the *old* one.
+
+StoatFlow refuses to compile the provable case — a **proven** re-key (`selectKey`/`map`/`groupBy`/…)
+feeding a Processor API node that connects a **writable** store — via the `papi-key-affinity-presumed`
+validation rule, default `error`. Read-only (KIP-813) stores are excluded: they cannot be written, so
+there is no update to lose.
+
+Where the feeder is itself a Processor API node the re-key is only **presumed** — `process()` and
+`Topology.addProcessor()` stamp `isKeyChanging = true` on every node, since the compiler cannot see
+inside a user `Processor`. That reports through `papi-key-affinity-presumed-chain`, default `warn`, and
+does **not** fail the build: a plain `process(parse).process(count, "store")` chain is exactly what a
+KSML-generated topology is made of, and Kafka Streams compiles and runs it. If the upstream node really
+does re-key, apply a remedy; if it does not, set that rule to `off`.
+
+What the check cannot see: per-lane instance fields (no declaration can express them), and a **store key
+that is not the record key** (`store.put(record.value().customerId, …)`), which reaches the same
+cross-barrier window with no re-key anywhere — it is computed at runtime. See
+`references/serdes-state-stores.md` § Multi-key atomicity.
+
+Remedies, in order: `repartition()` before the node (**in-memory in StoatFlow, not a Kafka topic**),
+`topology.processor-api-key-affinity: presumed`, or don't key store state by the post-re-key key.
+Two further consequences of `off`: a node whose boundary is elided joins the **upstream** sub-topology
+and inherits its lane count, and elided boundaries at storeless nodes are logged once at `INFO`.
+
 ```kotlin
 class UppercaseProcessor : ContextualFixedKeyProcessor<String, String, String>() {
     override fun process(record: FixedKeyRecord<String, String>) {
@@ -27,9 +66,25 @@ class UppercaseProcessor : ContextualFixedKeyProcessor<String, String, String>()
 `topic()`/`partition()`/`offset()`, `applicationId()`, `currentWatermarkMs()`, `currentStreamTimeMs()` (KS
 alias for the watermark), `currentSystemTimeMs()`, `getStateStore(name)`, `isLate()` (in `process`).
 
-**Store attachment:** either override `stores()` with `Stores.keyValueStoreBuilder(...)`, or
-`builder.addStateStore(...)` then look it up by name. Build store builders via `Stores`
-(`io.stoatflow.core.state`).
+**Store attachment — a processor may only reach a store CONNECTED to its node** (Kafka Streams rule;
+an undeclared `getStateStore(name)` throws `StoreNotConnectedException`, which is fatal and cannot be
+routed to `processing.exception.handler`). Two ways to connect one, and they union:
+
+1. override `stores()` on the supplier with `Stores.keyValueStoreBuilder(...)` — connects automatically;
+2. `builder.addStateStore(builder)` **and** name it at the call site:
+   `process(supplier, Named.as("node"), "my-store")` / `processValues(supplier, "my-store")`.
+   Registering without naming it does **not** connect it.
+
+Processor-API route: `topology.addStateStore(builder, "node")` or
+`topology.connectProcessorAndStateStores("node", "my-store")` — either order relative to `addProcessor`.
+
+Exempt, no declaration needed: **global** stores (`addGlobalStore`, `globalTable`) — also returned
+**read-only** to an ordinary processor, for every store family (plain, timestamped, versioned,
+headers-aware) and without changing the store's declared type — and **read-only** stores
+(`addReadOnlyStateStore`). Declaring a global store opts into write access (a StoatFlow extension).
+
+The failure surfaces on the first record reaching each lane, not at startup (instances are created
+per-lane on demand, including `init`). Build store builders via `Stores` (`io.stoatflow.core.state`).
 
 ## Threading — the rule that bites
 
@@ -95,7 +150,10 @@ Kafka. Two overloads:
 (6–7 fields, Sun=1), `.spring(...)` (6 fields); unparseable → `IllegalArgumentException`.
 
 `ScheduledEmitter<K,V>` receives `ScheduledEmitterContext`: `forward(key, value[, timestamp])` /
-`forward(record)`, `getStateStore(name)` (**read-only** — `put`/`delete` throw), `currentWallClockTime()`,
+`forward(record)`, `getStateStore(name)` (**read-only** — `put`/`delete` throw `UnsupportedOperationException`
+for every store family: plain KV/window/session as well as timestamped, versioned and headers-aware, incl.
+the timestamped store a DSL `Materialized` aggregation produces. The view keeps the store's declared type,
+so a `getStateStore<TimestampedKeyValueStore<..>>` cast still succeeds), `currentWallClockTime()`,
 `currentSystemTimeMs()`, `currentWatermarkMs()`/`currentStreamTimeMs()` (`Long.MIN_VALUE` until first event).
 
 ```kotlin

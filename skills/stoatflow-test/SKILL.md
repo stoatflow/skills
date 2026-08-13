@@ -94,13 +94,34 @@ The TTD is a **fidelity approximation**, not the engine:
   **structurally invisible** to the TTD — test those with a real broker.
 - **Boundary key serialization IS reproduced** (record path AND window-close/suppress/punctuator
   emissions): a key crossing a sub-topology boundary — where a re-keyed record reaches an aggregation,
-  a join, `toTable()`, `process()`/`processValues()`, or an explicit `repartition()` (ADR-138; a re-key
-  alone opens no boundary) — is
+  a join, `toTable()`, or an explicit `repartition()` (ADR-138; a re-key alone opens no boundary, and
+  since 1.0.0 `process()`/`processValues()` no longer open one either — `topology.processor-api-key-affinity`
+  defaults to `off`) — is
   serialized with the same resolved boundary serde as production, so an unresolvable re-keyed boundary
   raises `LaneKeySerializationException` in the test instead of only in production. If a previously-green
   test starts failing with it, the topology genuinely declares no serde for that re-keyed key — declare
   one (`Repartitioned`/`Grouped`/`Produced`/`Materialized`) or set the default key serde the app itself
-  uses.
+  uses. Note the boundary now **inherits** the nearest declaration from before the re-key as a last
+  resort (only when `default.key.serde` was never configured), so this reaches the exception less often
+  than it used to — it still fires when the re-key changes the key TYPE, since the inherited serde
+  cannot encode the new key.
+- **`topology.validation.<rule-id>` failures surface here too.** The rules are raised at
+  topology-compile time, so a rule at `error` fails `TopologyTestDriver` construction with no
+  broker — the aggregate message names every offending site. Useful as a deliberate guard in a test
+  suite; also the first thing to check when a driver suddenly refuses to build. At `warn` the same
+  line is simply **logged while the driver builds** — a WARN that used to appear only at
+  engine start, so a previously-silent suite can start printing it without anything having changed in the
+  topology.
+  **Defaults are per rule, and one of them is `error`:** `unresolved-boundary-key-serde`,
+  `inherited-boundary-key-serde` and `papi-key-affinity-presumed-chain` default to `warn`, but
+  **`papi-key-affinity-presumed` defaults to `error`** — a re-key feeding a Processor API node that
+  connects a writable store fails the driver. That is deliberate (it is silent data loss at runtime);
+  the remedies are `repartition()`, `topology.processor-api-key-affinity: presumed`, or re-keying the
+  store. Never tell a user a `topology.validation.*` key cannot fail their build.
+- **The driver inherits the builder's topology-build settings.** `TopologyTestDriver.fromBuilder(builder)`
+  with no explicit config picks up `subTopologySplit` / `processorApiKeyAffinity` from the
+  `StreamsBuilder(TopologyConfig(cfg))` it was given, so the driver compiles the shape production runs.
+  Pass a config explicitly and that config wins.
 
 ## Config-driven tests (StoatFlowTestDriver)
 

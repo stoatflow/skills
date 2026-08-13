@@ -45,7 +45,7 @@ record's lane affinity, not at every key change — so re-keying topologies have
 ids renumber. Any dashboard, alert or recording rule pinning a `sub_topology` / `subtopology_id` value, or a
 `lane_id=~"N_.*"` regex (lane ids are `{subtopology}_{lane}`), needs re-checking against a live scrape after an
 upgrade. Thread names (`stoatflow-{chain}-st{N}-lane-{L}`) and `/topology*` shift the same way.
-`stoatflow.topology.sub-topology-split: eager` restores the old numbering.
+`stoatflow.topology.sub-topology-split: eager` restores the old numbering. **1.0.0 renumbers a second time** for Processor-API topologies: `process()`/`processValues()` no longer open a boundary after a re-key (`stoatflow.topology.processor-api-key-affinity: off`, matching Kafka Streams); `presumed` restores those.
 
 **Naming modes** — use `both` to light up existing Kafka Streams dashboards during a migration:
 
@@ -80,9 +80,32 @@ stores, so prefer those over the per-store duplicates that exist for KS-dashboar
 caveats: `open.files` is not published (its RocksDB ticker is gone in the bundled RocksJava), and
 `*.min.ms` is JNI-only (the default FFM backend's statistics dump has no MIN token).
 
-- `stoatflow.dlq.abort.dropped.records` — source records whose outputs were dropped when a broker-side
-  production failure aborted the whole epoch under *continue*. Bounded data loss; any increase is worth
-  an alert. Counts the aborted epoch's offset span (includes the poison record), not dropped outputs.
+- `stoatflow.dlq.poison.replays.total` — **the one to alert on.** Poison-epoch replays: an asynchronous
+  broker-side production failure aborted an epoch, and rather than advancing past it StoatFlow held the
+  source offsets, restarted the engine in place, and reprocessed the epoch with the poison quarantined.
+  Each replay costs a full engine restart and briefly makes the pod unready. Bounded by
+  `stoatflow.commit-barrier.max-poison-replays` (default 10) within `poison-replay-window-ms` (default
+  60000) — but that budget is **in-memory**, so exhausting it ends the process, Kubernetes restarts the
+  pod, and the budget returns clean. `CONTINUE` is bounded **per process**, never end to end; a poison
+  derived from accumulated state does not converge and will crash-loop the pod.
+- `stoatflow.dlq.poison.quarantined.total` — source records the replay is skipping. A quarantined record
+  loses **all** of its outputs, across every sink it fans out to: bounded loss, not zero.
+- `stoatflow.dlq.poison.quarantine.size` — gauge, `0` in steady state; non-zero only between a poison
+  abort and the replay's first clean commit.
+- `stoatflow.dlq.poison.replay.budget.exhausted.total` — **alert on this one too.** The budget ran out
+  and the instance shut down with the offsets held instead of replaying again. It is the necessary
+  companion to `…replays.total`: that meter counts *replays*, so it stops incrementing at exactly the
+  moment a non-converging poison starts crash-looping the pod. Any non-zero value is an incident.
+- Two cases stop the instance immediately instead of replaying, with the offsets held so an operator
+  restart replays the epoch: a `FAIL` verdict (which now means what it says), and a `continue` on a
+  poison with no attributable source record — emitted by a punctuator, a window close, a suppression
+  flush, a timer or a scheduled source. Those planes fire on their own schedule and would re-poison
+  every attempt, so the shutdown message names the plane. A `retry` on one of those planes is different
+  and does **not** stop the instance: it means the send failed rather than the emission, so the epoch
+  replays and the send is re-attempted. Prevent the whole class by sizing the destination topic's
+  `max.message.bytes`.
+- `stoatflow.dlq.abort.dropped.records` was **retired** (ADR-140). It counted the source records an abort
+  permanently dropped; aborts no longer drop them.
 - `stoatflow.dropped.records.total{reason}` — six reasons: `null_key`, `late_window`, `late_session`,
   `join_null_key`, `join_null_value`, `table_source_null_key`. The tag *is* the semantics — always group
   by it rather than alerting on the bare total.

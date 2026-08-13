@@ -90,3 +90,41 @@ Correctness: `?force=true` overrides only the *readiness* check — a forced pro
 the committed changelog before processing. Split-brain is impossible under EOS (broker producer-epoch
 fence) and bounded-duplicate under ALO (the promotion token is the fence). Pausing the active does **not**
 promote a standby.
+
+### Application faults under HA
+
+With `ha.mode` **off** or **on**, a `StreamsUncaughtExceptionHandler` returning `REPLACE_THREAD` on a
+restartable fault (processing / production failure) gets a bounded **in-place engine restart**: the engine
+is rebuilt inside the live JVM and **the pod keeps the active role — no failover**. Budget
+`stoatflow.commit-barrier.max-engine-restarts` = 5 within `…engine-restart-window-ms` = 5 min.
+
+When the budget is spent the instance shuts down, and *that* is when the role moves — a graceful
+`DRAINING` hand-off, so a caught-up standby promotes on the fast path. One failover after a bounded number
+of local attempts, not one per fault.
+
+Not every fault is restartable. Deserialization failures, punctuator failures and commit stalls are not:
+the handler still runs (alerting/metrics fire) but a `REPLACE_THREAD` answer cannot be honoured, a WARN
+records it, and the instance drains and hands off.
+
+Operational consequences worth telling a user about:
+
+- **`/health/ready` is DOWN while a pod rebuilds** — it is not processing, and IQ endpoints served from it
+  are unavailable. An in-flight rolling update stalls; the pod leaves Service endpoints. Liveness is
+  unaffected (a successful in-place restart never reaches a terminal state).
+- **Role-change commands are refused mid-restart.** `/ha/switch`, `/ha/promote`, `/ha/demote` return
+  **409** if a pod the command would move is restarting — and `?force=true` does NOT override it (force
+  overrides the *readiness* judgement, not a structurally impossible operation). Every command moves the
+  **active**, so a `promote` is refused while the active it would supersede is rebuilding, not only when
+  its own `?pod=` target is. Poll `GET /ha/status` until `selfRestarting` / the peer's `restarting` is
+  false, then re-issue. A peer that has gone *stale* is not believed — a pod that died mid-restart cannot
+  lock the cluster out.
+- **Mixed-version clusters report `UNKNOWN`.** Mid rolling upgrade, a `role`/`state` published by a newer
+  build that this pod does not recognise shows as `UNKNOWN` on its `/ha/status`. The peer still counts as
+  alive but takes part in no promotion decision on that pod. It means "finish the upgrade", not "something
+  is broken".
+- **`stoatflow.ha.restarting`** (0/1 gauge) is the dashboard signal: the pod stays `ACTIVE` throughout, so
+  `stoatflow.ha.role` does not move. `stoatflow.engine.restart.total{trigger=replace_thread}` counts them.
+- Since 1.0.0-beta.8 a terminal failure publishes the hand-off from the state transition itself, so it no
+  longer depends on anything calling `close()`. Before that, an **embedded `:core`** deployment (no
+  `:runtime` wrapper, no user `close()`) left a dead engine heartbeating as a healthy active and the
+  standby never promoted — advise upgrading, or ensuring a liveness probe can reach the pod.

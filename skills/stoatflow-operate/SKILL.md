@@ -55,6 +55,11 @@ EOS producer epoch / the promotion token). `POST /ha/switch` (drains active, pro
 caught-up standby exists, override `?force=true`). A standby is promotion-eligible while total
 committed-changelog lag ≤ `stoatflow.ha.acceptable-recovery-lag` (default 50000, a **total sum**).
 
+A `REPLACE_THREAD` verdict works the same with HA on: a restartable fault is absorbed **in place** and the
+pod keeps the active role — no failover until the restart budget is spent. The pod is `/health/ready`-DOWN
+while it rebuilds, and role-change commands return **409** meanwhile (not `?force`-overridable). See the
+reference for the full behaviour and the embedded-`:core` caveat.
+
 ## Tuning levers (details in references/tuning.md)
 
 - **Lanes:** `stoatflow.lanes.count` (default `max(2, CPU cores)`) — start at cores for CPU-bound, 4×–8×
