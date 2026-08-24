@@ -71,7 +71,10 @@ stores:
 **Name every migrated store explicitly on both sides** (`Materialized.as(...)`,
 `StreamJoined.withStoreName(...)`, `TableJoined.as(...)`) so the `ksName → sfName` mapping is trivial — KS
 auto-generated names (`KSTREAM-AGGREGATE-STATE-STORE-0000000007`) are not guaranteed to match the ported
-topology's generated names.
+topology's generated names. This is mandatory for FK joins: with `TableJoined.as("{join-name}")` the
+subscription store is `{join-name}-subscription-store` on **both** sides, but an *unnamed* StoatFlow FK
+join auto-generates a counter-suffixed base (`ktable-fkjoin-0`, `ktable-fkjoin-1`, …) that never matches
+the KS auto-generated name.
 
 ## Classifying your stores (KS DSL operation → `type`)
 

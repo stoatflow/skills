@@ -103,7 +103,11 @@ caveats: `open.files` is not published (its RocksDB ticker is gone in the bundle
   every attempt, so the shutdown message names the plane. A `retry` on one of those planes is different
   and does **not** stop the instance: it means the send failed rather than the emission, so the epoch
   replays and the send is re-attempted. Prevent the whole class by sizing the destination topic's
-  `max.message.bytes`.
+  `max.message.bytes`. The same offset hold covers every **synchronous** `FAIL` too (processing, sync
+  production, punctuator/timer/scheduled-source): the epoch aborts, the instance stops, an operator
+  restart replays it (the consumer records via the held offsets — a punctuator tick or scheduled-source
+  firing does not itself re-fire retroactively) — and no dead letter is written on those routes (the
+  record was preserved, not dropped).
 - `stoatflow.dlq.abort.dropped.records` was **retired** (ADR-140). It counted the source records an abort
   permanently dropped; aborts no longer drop them.
 - `stoatflow.dropped.records.total{reason}` — six reasons: `null_key`, `late_window`, `late_session`,

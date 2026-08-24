@@ -154,8 +154,13 @@ productionExceptionHandler(
 ```
 
 Deser + processing defaults are **fail-fast** (no silent drops unless opted in). DLQ records ride the
-**same transactional producer** (atomic on the barrier). Error headers use the `__stoatflow.errors.*`
-namespace.
+**same transactional producer** (atomic on the barrier) — and only a `CONTINUE` verdict writes them:
+a **`FAIL` aborts the failing epoch** (offsets held, outputs discarded) and writes **no** dead letter
+on the processing/sync-production paths, because the record is preserved and replays on operator
+restart. A deserialization `FAIL` keeps the graceful stop instead — the failed record never enters the
+offset tracker, so the shutdown commits the pre-poison outputs and stops *before* the poison — and it
+writes no dead letter either. The processing handler renders its verdict **once** per failure (a FAIL
+is not re-offered at ancestor DAG levels). Error headers use the `__stoatflow.errors.*` namespace.
 
 **A size-rejected dead letter carries no value.** When the broker refuses an output record with
 `RecordTooLargeException`, the dead letter is emitted with `value = null` plus
@@ -173,7 +178,12 @@ secondary transaction carrying the dead letter alone, quarantines the poison's s
 restarts the engine in place, and **replays** the epoch with exactly that record skipped; the epoch's
 other records are reprocessed and commit normally. `RETRY` there means the same replay **without**
 quarantining (the record is fine, the send wasn't); under `AT_LEAST_ONCE` it is treated as `FAIL`.
-`FAIL` holds the offsets and stops, so an operator restart replays the epoch.
+`FAIL` holds the offsets and stops, so an operator restart replays the epoch — on **every** path: the
+synchronous routes (processing, sync production, punctuator/timer/scheduled-source) abort the epoch the
+same way, differing only in that they write no dead letter (the async path's rides a separate post-abort
+transaction). The replay covers the epoch's consumer records via the held offsets; a punctuator tick or
+scheduled-source firing does not itself re-fire retroactively (a cron occurrence crossed by the restart
+is skipped; interval schedules resume fresh).
 
 Loss is bounded to the poison record's **own** outputs across every sink it fans out to — not zero — and a
 poison derived from **accumulated state** never converges (the next record on that key reproduces it).
