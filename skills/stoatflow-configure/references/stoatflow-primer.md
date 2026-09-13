@@ -58,7 +58,7 @@ facts explain the rules above:
 
 ## Compatibility statement
 
-**Targets StoatFlow 1.0.0-rc.2 (Kafka Streams 4.3 API surface).** This is a pre-GA release —
+**Targets StoatFlow 1.0.0-rc.3 (Kafka Streams 4.3 API surface).** This is a pre-GA release —
 APIs may still change. If your StoatFlow version differs, prefer the matching tagged release of this
 pack. The divergence register (`KSC-NN` / `D-N`) is the authoritative list of where StoatFlow
 intentionally differs from Kafka Streams; the `stoatflow-port-from-ks` skill carries it in full.

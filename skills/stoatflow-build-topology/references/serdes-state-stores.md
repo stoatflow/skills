@@ -49,7 +49,7 @@ StoatFlow type. Resolution: explicit serde on the operator config (`Consumed`/`P
 | Key-value | `persistentKeyValueStore(name)` | `inMemoryKeyValueStore(name)` |
 | LRU | — | `lruMap(name, maxCacheSize)` |
 | Window | `persistentWindowStore(name, retention, windowSize)` | `inMemoryWindowStore(...)` |
-| Session | `persistentSessionStore(name, retention, inactivityGap)` | `inMemorySessionStore(...)` |
+| Session | `persistentSessionStore(name, retention)` | `inMemorySessionStore(name, retention[, expiryIndex])` 🆕 third param |
 | Timestamped KV (KIP-258) | `persistentTimestampedKeyValueStore(name)` | `inMemoryTimestampedKeyValueStore(name)` |
 | Timestamped window | `persistentTimestampedWindowStore(...)` | `inMemoryTimestampedWindowStore(...)` |
 | Versioned KV (KIP-889) | `persistentVersionedKeyValueStore(name, historyRetention)` | `inMemoryVersionedKeyValueStore(...)` 🆕 |
@@ -58,12 +58,61 @@ Durations are `java.time.Duration`; window/session retention ≥ window size; na
 Store builders: `Stores.keyValueStoreBuilder(supplier, keySerde, valueSerde)` (+ `windowStoreBuilder`/
 `sessionStoreBuilder`/`versionedKeyValueStoreBuilder`).
 
+**In-memory session store expiry (StoatFlow-only `expiryIndex`).** The in-memory session store's map is
+key-first, so its default expiry pass walks every live session on every watermark advance (~50 ns each in the
+reference measurement, 4–23 ns on a densely packed heap: 25 ms per barrier at 500 k sessions; past ~3 M sessions
+per store it exceeds the 150 ms barrier floor) on the punctuation lane the commit waits for. It logs one WARN
+per store the first time a pass exceeds 15 ms on a store of ≥ 100 k live sessions.
+Opt in per store with the third argument on **both** factories — `Stores.inMemorySessionStore(name, retention,
+expiryIndex = true)` / `Stores.inMemorySessionStoreWithHeaders(name, retention, expiryIndex = true)` — via
+`Materialized.as(supplier)` (the supplier wins over `withStoreType`, KSC-100) or `Stores.sessionStoreBuilder(supplier, k, v)`.
+The trade: expiry cost moves from *how many sessions are alive* (the per-pass walk, gone — ~1 µs, flat) to
+*how many expire* (≈ 4× dearer per removal, end-time-order removal), plus ≈ 0.3 µs per put and 60 B heap per
+live session. Wins in any steady state where sessions outlive a minute or two; loses on a pass that expires a
+large fraction of the store at once. Both arms warn once per store over 15 ms (≥ 100 k live sessions).
+**Do not opt in blindly — evaluate on the real workload** (index off vs on: `stoatflow.barrier.commit.latency`,
+`stoatflow.store.num.keys`, heap, the warning). Starting point: off below ~100 k live sessions; usually on from
+~100 k, confirmed against the session churn; past a few million, or when most of the store expires in one pass
+as a steady state, prefer `persistentSessionStore`. Nothing is
+persisted — enabling it is a restart. Not a config key; no KS equivalent (KS's in-memory session store is
+end-time-first instead).
+
 **`Materialized`** (`io.stoatflow.core.topology`): `Materialized.as<K,V,StateStore>("name")`,
 `Materialized.as(StoreType.ROCKS_DB)`, `Materialized.as(supplier)`, `Materialized.with(k,v)`. Options:
 `.withKeySerde`/`.withValueSerde`, `.withStoreType(StoreType.IN_MEMORY | ROCKS_DB)`, `.withRetention(d)`,
 `.withCachingEnabled([config])`/`.withCachingDisabled()`, `.withLoggingEnabled([topicConfig])`/
-`.withLoggingDisabled()`, `.withRecordHeaders()` (KIP-1271). Store-type precedence (ADR-029): `withStoreType`
-> explicit supplier > RocksDB default.
+`.withLoggingDisabled()`, `.withRecordHeaders()` (KIP-1271), `.withChangelogNumPartitions(n)` (StoatFlow
+extension — no KS equivalent). Store-type precedence (Kafka Streams' order,
+KSC-100): an explicit `Materialized.as(supplier)` > `withStoreType` > RocksDB default; neither setter clears
+the other, and with both set the supplier wins with one WARN. Same per side on `StreamJoined`.
+
+**`.withChangelogNumPartitions(n)` — per-store changelog partition count** (also on `StreamJoined`, the
+Processor-API `StoreBuilder`, and `Suppressed.BufferConfig`; the unmaterialized timer store uses the
+`stoatflow.changelog.timer-num-partitions` config key). Defaults to the global
+`stoatflow.changelog.num-partitions` (**3**). No KS equivalent: KS co-partitioning forces the changelog
+partition count to equal the source topic's, so it is never a decision there.
+
+The count sets a changelog's **write-throughput ceiling** and how the store's write load **shards across
+brokers**; faster cold-start restore is secondary and sub-linear (one restore task per partition, but one
+store restores into one RocksDB whose writes serialise, and all stores share one worker pool). The cost is
+paid on **every commit**: changelog records ride the same transaction as sink records, so each partition a
+store's epoch touches widens that commit.
+
+Guidance: **prefer small counts; raise a store only on a measurement.** `restorationPoolSize` is a ceiling
+beyond which restore parallelism cannot help, never a target. The override is **bidirectional** — with the
+default at 3, the everyday use is pinning a small store (lookup table, config table)
+back to `1`. On `StreamJoined` the number is **multiplied**: one call sets it on 2 stores (INNER) or 3
+(LEFT/OUTER), so `(6)` means 12 or 18 partitions.
+
+**It is create-time immutable.** Changing it later is a no-op plus a startup WARN — StoatFlow never
+re-partitions a live changelog. To change it, wipe local state AND delete/recreate the changelog topic.
+Never increase a compacted changelog's partition count by hand: keys re-map while stale values survive in
+the old partitions, and the restore reconstructs corrupted state. Unrelated to
+`Repartitioned.numberOfPartitions`, which sizes a repartition/lane fan-out.
+
+A custom Kafka `partitioner.class` is **refused at startup** — it would break the changelog-key ->
+partition pinning this rests on. Customise sink partitioning with `Produced.withStreamPartitioner(...)` or
+`Repartitioned.streamPartitioner(...)`.
 
 **`.withRecordHeaders()` is close to a one-way door.** Turning it *on* is free — a lazy in-place upgrade,
 no pause, no rewrite. Turning it *off* again over a store that has already migrated data is a **declared
@@ -77,6 +126,9 @@ same downgrade; the acknowledgement key is StoatFlow's addition. See `stoatflow-
 operational side.
 
 Store handles: `KeyValueStore<K,V>` (`get`/`put`/`delete`, atomic `compute(key, fn)` / `merge(key, value, fn)`);
+**to delete a key, write `put(key, null)` unless you need the previous value** — `delete()` returns it, so it
+reads (and deserialises) it first; `put(key, null)` is the same tombstone without the read, and it is what
+both StoatFlow's DSL and Kafka Streams do internally (https://stoatflow.io/docs/building/state-stores#deleting-a-key);
 read-only `ReadOnlyKeyValueStore` (`get`, `containsKey`, `all`/`reverseAll`, `range`/`reverseRange`,
 `prefixScan(prefix, serializer)`, `approximateNumEntries`); `KeyValueIterator` is `Closeable`. Range bounds
 are KS-exact (KIP-763): a null bound is open-ended (both null ≡ `all()`), `reverseRange` takes ascending
@@ -88,6 +140,25 @@ WARN — the same rules apply to the window/session key-range queries (`fetch(ke
 `withLoggingDisabled()` (then unrecoverable after a crash). Caching only affects downstream *emissions*
 (the changelog compacts to the final value per barrier); `withCachingDisabled()` emits every intermediate.
 Versioned `historyRetention` is retention **and** grace (older out-of-order records rejected).
+
+**Versioned-store retention is a minimum bound, and its read contract matches Kafka Streams.** A
+point-in-time read below `observedStreamTime - historyRetention` (inclusive) is outside the window: it
+returns the **latest** version when that version is old enough to satisfy the bound, and `null`
+otherwise — so a key written once and never updated keeps answering forever, while superseded history
+ages out. Physical reclamation lags: expired versions stop being readable immediately but are removed by
+a background sweep that runs a slice per commit, targeting one `stoatflow.state.versioned.sweep-period-ms`
+(default 15 min) for a full pass. Two operational consequences: on-disk size is bounded rather than
+exact, and a hot-standby replica does not sweep at all (it has no commit barriers) — but it now *applies*
+the active's reclamation tombstones through the same restore seam, so its copy tracks the active within
+replication lag rather than growing until promotion. A standby that stops shedding is a real signal. Kafka Streams reclaims by dropping
+whole segments instead, and does not persist its observed stream time — StoatFlow does, so the grace
+floor survives a restart rather than being rebuilt from the first record after it. Its **changelog** is `compact` with unlimited retention (as KS's is, and for the same reason): one row per version means compaction cannot collapse them, and a delete policy would eventually remove the only row of a key written once and never updated. The topic is bounded by **explicit reclamation** instead — the sweep writes a tombstone for each version it removes locally, which is what gives compaction something to act on. Three clocks, only the first immediate: the read window (immediate), the sweep (within one `sweep-period-ms`), then the broker's compaction cadence. That third one matters because the log cleaner never touches the *active* segment, so StoatFlow sets `segment.ms` + `max.compaction.lag.ms` to the sweep period — floored at **five minutes**, below which the broker bound stops tracking the configured period — and `min.cleanable.dirty.ratio` to 0.1 when it creates the changelog; Kafka's own `segment.ms` default is **7 days**, and a changelog created before this shipped keeps it (reconciliation only adjusts `cleanup.policy`/`retention.ms`). The topic grows before it shrinks, since a version costs one extra key-sized record on its way out. `stoatflow.store.versioned.sweep.tombstones.total` lagging `…sweep.reclaimed.total` persistently means the local store is shedding but the topic is not.
+
+**Window/session retention is a minimum bound on a persistent store.** Expiry drops whole segments, so the one containing `watermark - retention` is retained in full: effective retention is **up to** `retention + segmentInterval`. Segments are sized `max(retention / 3, 60 s, windowSize)` on every persistent DSL or `Stores`-built window store (the stream-stream join buffers included) and `max(retention / 3, 60 s)` on every persistent session store (no window size); in-memory stores are not segmented at all; a hand-built non-segmented store — nothing the DSL or `Stores` builds — omits the window-size term. Where the divisor governs that is **up to 4/3x** what you configure; where `windowSize` governs — segmented only, and the default for `TimeWindows.ofSizeWithNoGrace`, which makes `retention == windowSize` — it is **up to 2x**. Below about three minutes of retention the 60-second floor governs **provided `windowSize <= 60 s`** — a larger window still wins (at `retention = 2 min, windowSize = 90 s` the interval is 90 s, for an effective 3 min 30 s). Being on the floor also says nothing about the segment *count*. Segments are fixed-width and epoch-aligned, so the count is `retention / segmentInterval` whole intervals plus the boundary one when the watermark lands on a segment edge, and `ceil(retention / segmentInterval) + 1` in the worst phase — the same number when the retention divides evenly, one higher when it does not — size against the maximum. 2 min of retention on a 60 s interval keeps three; 120 s over 90 s segments keeps two or three depending on phase. A single segment is never guaranteed. That assumes one uniform layout: after a retention or interval change, existing segments keep the span they were recorded with (ADR-141), so until they age out the live set is a mix of widths and the formula does not apply — size against `retention + the widest existing span` through that transition. That floor regime is also a *large* multiple rather than a small one: `retention + 60 s` is **3x** at 30 s retention, and it applies to StoatFlow as much as to KS (ADR-141), so it is not a KS-only footnote. Under `EmitStrategy.onWindowClose()` expiry is gated on the durable emit frontier instead of the committed watermark, adding a further `(watermark - emit frontier)` term that the retention contract does not bound. The in-memory stores drop per record, so they retain exactly **1x** — switching `StoreType` changes observable retention. Kafka Streams sizes segments `max(retention / 2, 60_000)` on both backends, so it keeps up to 3/2x: a ported app retains somewhat **less** here on join buffers and session stores, and **more** on a default windowed aggregation. Not configurable (ADR-030, ADR-141).
+
+**Changing retention on an existing segmented store is safe** (ADR-141): each segment records its own time range on disk, so the change remaps rather than reinterpreting what is already there — no restore, unlike Kafka Streams. (Join buffers remap too since 2026-09-03; only a hand-built non-segmented store keeps the interval in every key, where a retention change that moves it needs a restore.) Changing the **window size**, switching **plain↔timestamped**, changing the store type, or flipping `retainDuplicates` cannot remap: each is detected at startup, logged with the field that moved, and answered with a full restore from the changelog. A store with no changelog to rebuild from refuses to start instead, naming every affected store — `stoatflow.state.layout-mismatch: wipe-and-restore` accepts the loss and starts those stores empty.
+
+After a retention *narrowing*, existing segments keep the span they were written with, so disk frees gradually and effective retention stays at `retention + the widest existing span` until they age out. One `INFO` line at startup says so.
 
 ### Multi-key atomicity: `KeyLockManager`, and the one thing it cannot do
 

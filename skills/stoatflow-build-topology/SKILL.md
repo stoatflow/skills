@@ -28,7 +28,7 @@ fun buildTopology(builder: StreamsBuilder) {
 StoatFlowRuntime.fromConfig(topologyBuilder = { buildTopology(it) }).start()
 ```
 
-Sources: `builder.stream(topic|collection|Pattern, Consumed?)` → `KStream`; `builder.table(...)` → `KTable`
+Sources: `builder.stream(topic|collection|Pattern, Consumed?)` → `KStream` (a `Pattern` subscribes every matching topic and picks new ones up within `metadata.max.age.ms`, 30 s default; N patterns OR-combine; a topic two patterns accept is rejected at assignment; StoatFlow does NOT exclude its own changelog/HA/DLQ topics — scope the pattern); `builder.table(...)` → `KTable`
 (always materialized, store `{topic}-store`); `builder.globalTable(...)` → `GlobalKTable`;
 `builder.scheduled(...)` → `KStream` (🆕 no KS equivalent — see `references/processor-api.md`). Sinks:
 `stream.to(topic|TopicNameExtractor, Produced?)`, `forEach`, `print`.

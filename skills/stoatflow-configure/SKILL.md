@@ -62,8 +62,13 @@ runtime:
   restore). An empty headers keyspace is dropped in place for free; a store with no recovery source
   (`withLoggingDisabled()`, or the changelog globally off) is refused regardless. A downgrade sheds
   persisted headers, and re-enabling headers does **not** bring them back.
-- **`stoatflow.changelog`** — `enabled`, `replication-factor` (-1 = broker default), `num-partitions` (1).
+- **`stoatflow.changelog`** — `enabled`, `replication-factor` (-1 = broker default), `num-partitions` (3;
+  per-store override via `Materialized.withChangelogNumPartitions(n)` and its siblings — prefer small
+  counts, and note the count is create-time immutable), `timer-num-partitions` (-1 = inherit).
 - **`stoatflow.watermark`** — `max-out-of-orderness-ms` (10000), `idleness-timeout-ms`, `auto-interval-ms`.
+  `idleness-timeout-ms` is the **default** for sources that set no `WatermarkStrategy.withIdleness(...)` of
+  their own; a per-source timeout wins for that source's partitions. `0` disables idleness only for the
+  sources that inherit the default, and the start-up WARN names those sources.
 - **`stoatflow.ha`** — `mode` (`off` default | `active-standby`), `acceptable-recovery-lag`,
   `desired-standbys`/`max-standbys`, `failover-priority`, coordination/heartbeat knobs (see
   `stoatflow-operate`).

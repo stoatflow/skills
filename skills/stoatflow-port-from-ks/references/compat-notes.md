@@ -21,6 +21,15 @@ regressing working code.
   versioned variants, `KeyValueIterator`/`WindowStoreIterator`, `ValueAndTimestamp`, `Windowed`,
   `VersionedRecord`, and the `Stores` factory + `*BytesStoreSupplier`/`StoreBuilder` family are all present
   and survive obfuscation in the published jar.
+- **`Materialized.as(supplier).withStoreType(...)`** (KSC-100) — resolves as in KS: the explicit supplier
+  wins, `withStoreType` / `withDslStoreSuppliers` fills in only where no explicit supplier is set, and no
+  setter clears the other (same per side on `StreamJoined`). Before 2026-09-09 StoatFlow had this inverted
+  — the store type outranked *and erased* the supplier — so a ported topology that set both silently
+  changed backend. Nothing to change; both set → one WARN per store naming the ignored store type.
+- **`KeyValueStore.delete()`** — the same read-then-write as in KS: it returns the previous value, so it reads
+  (and deserialises) it first. Nothing to port — but when the value is not needed, write `put(key, null)`
+  instead: the same tombstone without the read, in both engines (both StoatFlow's DSL and Kafka Streams
+  tombstone that way). https://stoatflow.io/docs/building/state-stores#deleting-a-key
 - **`Named`** is subclassable (KSML name-validation subclasses work); `Stores.*` returns the KS
   `*BytesStoreSupplier` / `StoreBuilder` types.
 - **Interactive-query metadata** (KSC-47) — `StoatFlow.queryMetadataForKey`/`streamsMetadataForStore`/

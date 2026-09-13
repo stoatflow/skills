@@ -68,7 +68,7 @@ Key config (defaults):
 |---|---|---|
 | `stoatflow.ha.mode` | `off` | `off` (single instance) or `active-standby` |
 | `stoatflow.ha.pod-id` | `POD_NAME`→`HOSTNAME`→hostname | stable per-pod identity |
-| `stoatflow.ha.coordination-topic` | `__stoatflow_<applicationId>_ha` | single-partition compacted coordination topic |
+| `stoatflow.ha.coordination-topic` | `__stoatflow_<applicationId>_ha` | single-partition compacted coordination topic; 1 partition is the required shape, and a pre-existing topic with a different count is **warned about at startup, not rejected** (reads and writes are both pinned to partition 0, so extra partitions are unused) |
 | `stoatflow.ha.acceptable-recovery-lag` | `50000` | **total** committed-changelog lag (all partitions summed) at/below which a standby is `READY_STANDBY` + promotion-eligible |
 | `stoatflow.ha.desired-standbys` | `1` | warm spares the readiness redundancy-floor protects |
 | `stoatflow.ha.max-standbys` | `3` | hard ceiling (total instances ≤ max-standbys + 1) |
@@ -124,6 +124,26 @@ Operational consequences worth telling a user about:
   is broken".
 - **`stoatflow.ha.restarting`** (0/1 gauge) is the dashboard signal: the pod stays `ACTIVE` throughout, so
   `stoatflow.ha.role` does not move. `stoatflow.engine.restart.total{trigger=replace_thread}` counts them.
+- **A source-topic-set change restarts the active in place too** (ADR-143): a topic newly matching a
+  `stream(Pattern)` source, a partition-count increase, or a source topic being deleted, is detected by a check
+  every 10 s, confirmed on the next
+  check, and absorbed by an automatic in-place engine restart — `stoatflow.engine.restart.total{trigger=source_topics_changed}`,
+  outside the fault budget; readiness is DOWN for the swap + restore. `stoatflow.ha.restart.required` now flags
+  only a *declined* restart (pod already closing/demoting). A pattern matching nothing at promotion idles until
+  the first matching topic appears.
+- **Deleting a source topic is the expensive direction**, and before 1.0.0-rc.3 it wedged the active outright.
+  The active assigns partitions manually, so there is no revocation to react to and the deletion is only seen by
+  that 10 s check; records already consumed from the deleted topic are still named in the in-flight offset
+  commit, which the broker rejects retriably and the client retries without end. Symptom before the fix: the pod
+  stops committing and sits in `RESTORING` with no error — the restart begins and its teardown hangs. Advise
+  draining a topic rather than deleting it under load, and expect a pause of about a minute at the defaults
+  even with the fix (measured ~66 s): it is dominated by the commit already in flight when the topic went
+  away running out `barrier-timeout-ms`, not by the 10 s detection window.
+  **This cost is HA-specific, and applies to PATTERN-matched topics.** Without HA the app uses a consumer group,
+  so deleting a pattern-matched topic arrives as a revocation within ~130 ms, is classified as a gone topic (not
+  a second instance), and an in-place `ABORT` restart has it committing again in ~0.5 s stateless / ~1 s
+  stateful. Do not quote the ~66 s figure for a non-HA deployment. A deleted *literal* source topic stays fatal
+  either way (KS-exact) — advise a pattern source for topics that are expected to come and go.
 - Since 1.0.0-beta.8 a terminal failure publishes the hand-off from the state transition itself, so it no
   longer depends on anything calling `close()`. Before that, an **embedded `:core`** deployment (no
   `:runtime` wrapper, no user `close()`) left a dead engine heartbeating as a healthy active and the

@@ -63,7 +63,11 @@ Main metric families (level `info`): throughput/latency (`stoatflow.lane.records
 `stoatflow.barrier.trigger.total{TIME,RECORD_COUNT,MEMORY_PRESSURE,CACHE_PRESSURE}`), watermarks
 (`stoatflow.watermark.{current,lag.ms,late.records.total}`), changelog/restoration
 (`stoatflow.restoration.{in.progress,records.restored.total}`), consumer/producer
-(`stoatflow.consumer.lag.records`), client state (`stoatflow.client.state` — ordinal, `== 4` = RUNNING =
+(`stoatflow.consumer.lag.records`; `stoatflow.consumer.partition.forgotten.total{reason}` — source partitions
+dropped because their topic is gone (`topic_deleted` = a deleted pattern topic, answered by an in-place engine
+restart; `ha_source_shrink` = the HA detector's confirmed shrink);
+`stoatflow.source.pattern.matched.topics{source}` — topics a pattern source
+currently matches, `0` = matches nothing yet), client state (`stoatflow.client.state` — ordinal, `== 4` = RUNNING =
 healthy-and-processing), HA (`stoatflow.ha.*`, only when on), and license
 (`stoatflow.license.valid{tier}`). JVM/Kafka-client metrics via `bind-jvm-metrics` (default true).
 
@@ -114,6 +118,54 @@ caveats: `open.files` is not published (its RocksDB ticker is gone in the bundle
   `join_null_key`, `join_null_value`, `table_source_null_key`. The tag *is* the semantics — always group
   by it rather than alerting on the bare total.
 - Store operation latency is `stoatflow.store.{get,put,delete,range,all,flush}.latency` (all `debug`).
+- `stoatflow.store.segments{store_name,store_type}` (`info`) — live RocksDB instances a **segmented**
+  window/session store holds (~7 file descriptors each, no upper bound). Plateaus at
+  `retention / segmentInterval + 1` while event time advances; **climbs** for as long as the watermark is
+  pinned by a lagging-but-live partition, or an idle one whose effective timeout is 0. `GET /watermarks`
+  reports `idlenessTimeoutMs` per partition — the timeout actually in force for it (the source's own
+  `withIdleness` if set, else `watermark.idleness-timeout-ms`), without which `idle` and `lastEventTimeMs`
+  cannot be interpreted once timeouts differ per source. The
+  RocksDB metric family sums its properties across segments and never publishes this count.
+- `stoatflow.watermark.lag.ms` (`info`) — `now − global watermark`, sampled every second **whether or not
+  the watermark advanced** (until 2026-09-03 it was written only on an advance, so it froze at a healthy
+  value during exactly the stall it exists to reveal); `-1` until the first watermark. Alert on it, and
+  read the segment gauge to see which stores are paying for the stall.
+- `stoatflow.store.versioned.sweep.lag.ms{store_name}` — ms since a versioned (KIP-889) store's last
+  **completed** history-reclamation pass. Versioned retention is a *minimum* bound: reads stop answering
+  for expired versions immediately, but the bytes go on a rolling sweep targeting one
+  `stoatflow.state.versioned.sweep-period-ms`. Alert when this stays above that period. The bound holds on
+  a **quiet** application too, under both processing guarantees: an idle app still commits on a slow
+  cadence (30 s by default) precisely so the sweep keeps running, and goes quiet again once nothing is
+  left to reclaim — so a flat, healthy reading on an idle app is the real one, not a frozen gauge. Its companion
+  `stoatflow.store.versioned.sweep.budget.exhausted.total{store_name}` climbing steadily means the
+  configured period is not achievable at that store's size — raise
+  `stoatflow.state.versioned.max-scan-bytes-per-barrier` or accept a longer period. Both are `info`;
+  `stoatflow.store.versioned.sweep.position` is `debug` progress detail. The per-barrier budget is shared
+  across every versioned store on a sub-topology, so adding stores does not multiply the commit cost.
+  A hot standby never sweeps (no commit barriers), so these read as idle there — but it does apply the
+  active's reclamation tombstones through the restore seam, so its footprint tracks the active within
+  replication lag rather than growing until promotion. Size a standby's disk like the active's; a standby
+  whose footprint grows while the active's stays flat is a real signal, not the documented normal.
+- `stoatflow.store.versioned.sweep.reclaimed.total{store_name}` and
+  `stoatflow.store.versioned.sweep.tombstones.total{store_name}` (`info`) — versions the sweep removed
+  from the **local store**, and the reclamation tombstones it wrote to the **changelog**. Read them as a
+  pair. A versioned changelog's key is the composite `[key][timestamp]`, so log compaction can never
+  collapse versions on its own; the topic is bounded only because the sweep writes one Kafka null per
+  reclaimed version. In a healthy steady state the two counters track each other. **A persistent gap —
+  reclaiming but not tombstoning — means the local store is shedding while the topic grows without
+  bound.** Expected to be zero for a store with logging disabled (there is nothing to write to). The
+  tombstone counter counts records handed to the changelog *writer*: under exactly-once that send is
+  buffered into the epoch's transaction, so a broker-side failure shows up as a failed commit rather
+  than as a gap here. The topic's own shrink lags further still — the broker frees space on its
+  compaction cadence, which StoatFlow now sizes on creation (`segment.ms` and `max.compaction.lag.ms`
+  set to the sweep period, `min.cleanable.dirty.ratio` 0.1); changelogs created before that shipped keep
+  Kafka's defaults, where a 7-day `segment.ms` leaves a tombstone unable to free anything for a week.
+- `stoatflow.store.versioned.sweep.failures.total` (untagged, `info`) — reclamation ticks that failed.
+  The tick catches everything by design, because a sweep failure has no business unwinding into the
+  commit protocol; the consequence is that a persistently-broken sweep is otherwise invisible outside the
+  log while the app looks healthy. **Any sustained increase means reclamation is not running at all** and
+  the store is growing without bound. Untagged deliberately: the failure can precede store resolution,
+  and the accompanying WARN names the sub-topology.
 
 **Headline alerts:**
 

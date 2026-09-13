@@ -6,7 +6,7 @@ are Kafka `org.apache.kafka.common.serialization.Serde`/`Serdes`. Every operator
 
 ## Sources & sinks
 
-- `builder.stream<K,V>(topic | Collection<String> | Pattern, Consumed?)` → `KStream`
+- `builder.stream<K,V>(topic | Collection<String> | Pattern, Consumed?)` → `KStream`. A `Pattern` source: whole-name `matches()`; new matching topics picked up within `metadata.max.age.ms` (30 s default for pattern topologies) as an incremental assignment; several patterns are fine but a topic matched by two is rejected at assignment; a literal topic a pattern also matches is rejected at build; matching nothing = WARN + wait; **no own-topic filtering** — keep `<appId>-*-changelog`, the HA coordination topic and DLQ topics out of the pattern (ADR-143). **A matched topic being DELETED is survived** — the engine restarts in place (~0.5-1 s, no pod restart) and converges on the remaining topics; a deleted *literal* source topic is still fatal, matching KS
 - `builder.table(topic, Consumed?, Materialized?)` → `KTable` (always materialized; store `{topic}-store`)
 - `builder.globalTable(...)` → `GlobalKTable` (single-instance: functionally identical to `table`; KS compat)
 - `stream.to(topic, Produced?)` / `stream.to(TopicNameExtractor, Produced?)` (per-record routing) · `forEach` · `print`

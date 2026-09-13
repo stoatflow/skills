@@ -97,14 +97,19 @@ stoatflow:
 **StoatFlow framework defaults (overridable — Layer 2):**
 
 - Consumer: `max.poll.records` 500, `fetch.max.bytes` 50 MiB, `max.partition.fetch.bytes` 10 MiB (Kafka 1
-  MiB), `auto.offset.reset` `earliest` (matches KS), `max.poll.interval.ms` 10 min (Kafka 5 min).
+  MiB), `auto.offset.reset` `earliest` (matches KS), `max.poll.interval.ms` 10 min (Kafka 5 min),
+  `partition.assignment.strategy` `CooperativeStickyAssignor` (Kafka's default list runs eager Range; under it
+  a topic newly matching a pattern source or a partition-count increase terminated the single instance —
+  ADR-143; overriding to an eager assignor logs a startup WARN). Conditional: a topology with a pattern
+  source — `stream(Pattern)` or Processor-API `addSource(…, Pattern)` — sets `metadata.max.age.ms` 30 s (Kafka
+  5 min) unless you set it; `/config` shows the effective value.
 - Producer: `batch.size` 256 KiB, `linger.ms` 20, `retry.backoff.ms` 50, `buffer.memory` 256 MiB,
   `enable.idempotence` true, `acks` all, `max.in.flight.requests.per.connection` 5.
 
 **Forced overrides (the last layer — you cannot change these):**
 
 - Consumer: `bootstrap.servers`, `group.id` = applicationId, `group.instance.id` = applicationId (KIP-345;
-  **omitted under HA** `assign()`), `enable.auto.commit=false`; **EOS only:** `isolation.level=read_committed`
+  **omitted under HA** `assign()`), `enable.auto.commit=false`, `allow.auto.create.topics=false`; **EOS only:** `isolation.level=read_committed`
   (KSC-93 — an EOS app must not ingest a transactional upstream's aborted batches; under ALO the key is
   user-settable).
 - Producer (always): `bootstrap.servers`, `retries=Integer.MAX_VALUE`, `max.block.ms` = barrier timeout,
@@ -112,7 +117,7 @@ stoatflow:
 - Producer (**EOS only**): `transactional.id` = `{applicationId}-producer`, `transaction.timeout.ms` =
   barrier timeout, `enable.idempotence` true, `acks` all, `max.in.flight.requests.per.connection` 5. (Under
   ALO these last three revert to the overridable framework defaults.)
-- Restoration consumer: `group.id` = `{applicationId}-restoration-{timestamp}`, `enable.auto.commit=false`,
+- Restoration consumer: `group.id` = `{applicationId}-restoration-{timestamp}`, `enable.auto.commit=false`, `allow.auto.create.topics=false`,
   `auto.offset.reset=earliest`, `isolation.level` = `read_committed` (EOS) / `read_uncommitted` (ALO).
 
 **Security: set it once, on the consumer.** `security.*` / `ssl.*` / `sasl.*` under

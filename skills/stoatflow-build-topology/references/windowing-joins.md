@@ -32,9 +32,12 @@ val tumbling: KTable<Windowed<String>, Long> =
 
 **Suppression:** `KTable.suppress(Suppressed.untilWindowCloses(bufferConfig))` (windowed) /
 `Suppressed.untilTimeLimit(duration, bufferConfig)`. `Suppressed.BufferConfig`: `unbounded()`,
-`maxRecords(n)`, `.emitEarlyWhenFull()`, `.shutDownWhenFull()`, `.withLoggingDisabled()`. **`maxBytes(...)`
+`maxRecords(n)`, `.emitEarlyWhenFull()`, `.shutDownWhenFull()`, `.withLoggingDisabled()`,
+`.withChangelogNumPartitions(n)` (StoatFlow extension). **`maxBytes(...)`
 throws `UnsupportedOperationException`** (StoatFlow buffers in-memory objects, not bytes) — use
-`maxRecords`.
+`maxRecords`. The buffer's changelog **follows the global `changelog.num-partitions` by default**, like
+every other store — no surface carries its own default — so set
+`.withChangelogNumPartitions(n)` only on a measurement. See `references/serdes-state-stores.md`.
 
 **Windowed-key serdes:** `WindowedSerdes.timeWindowedSerdeFrom(inner)` /
 `sessionWindowedSerdeFrom(inner)`. StoatFlow takes a `Serde<T>` inner (KS takes `Class<T>`) and no
@@ -49,8 +52,11 @@ Joiners: `ValueJoiner<V1,V2,VR> = (left,right)->result`, `ValueJoinerWithKey<K,V
   — `join`/`leftJoin`/`outerJoin`. `JoinWindows`: `ofTimeDifferenceWithNoGrace(d)` /
   `ofTimeDifferenceAndGrace(d, grace)` / `.before(d)` / `.after(d)`. `StreamJoined`: `.as(name)`,
   `.with(keySerde, leftValueSerde, rightValueSerde)`, `.withStoreName(base)` (→ `{base}-left-store` /
-  `{base}-right-store`), `.withThisStoreSupplier`/`.withOtherStoreSupplier`,
-  `.withDslStoreSuppliers(StoreType.IN_MEMORY)`, `.withLoggingDisabled()`. **Unmatched left/outer results
+  `{base}-right-store`), `.withChangelogNumPartitions(n)` (StoatFlow extension — **multiplied**: it sets
+  the count on both buffers, plus `-outer-store` on LEFT/OUTER, so `(6)` is 12 or 18 partitions),
+  `.withThisStoreSupplier`/`.withOtherStoreSupplier` (must retain duplicates —
+  `Stores.persistentWindowStore(..., retainDuplicates = true)` — or the build throws `KSC-99`),
+  `.withDslStoreSuppliers(StoreType.IN_MEMORY)` (both stores retain duplicates), `.withLoggingDisabled()`. **Unmatched left/outer results
   emit when the window closes** (watermark-driven), not on left-record arrival.
 - **Stream-table:** `stream.join(table, joiner, Joined?)` / `leftJoin` — point-in-time lookup (table
   updates do **not** re-trigger); **no `outerJoin`**; key preserved; table must be materialized. `Joined`

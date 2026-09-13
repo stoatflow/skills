@@ -86,6 +86,30 @@ headers-aware) and without changing the store's declared type — and **read-onl
 The failure surfaces on the first record reaching each lane, not at startup (instances are created
 per-lane on demand, including `init`). Build store builders via `Stores` (`io.stoatflow.core.state`).
 
+## Event time on a Processor API source (🆕 `addSource(WatermarkStrategy, …)`)
+
+`topology.addSource(timestampExtractor, name, topics…)` wraps the extractor in an adapter that pairs it
+with a monotonous (Kafka Streams stream-time) generator. That is a sensible default but it is *only* a
+default — it cannot express a bounded-out-of-orderness generator, a per-source idleness timeout, or
+watermark alignment.
+
+Use the watermark-strategy overload when the source needs any of those:
+
+```kotlin
+val strategy = WatermarkStrategy
+    .forBoundedOutOfOrderness<String, Order>(Duration.ofSeconds(30))
+    .withTimestampAssigner { _, v, _ -> v!!.eventTime }
+    .withIdleness(Duration.ofMinutes(2))
+
+topology.addSource(strategy, "orders-src", "orders")
+// or with an offset-reset policy:
+topology.addSource(AutoOffsetReset.Earliest, strategy, "orders-src", "orders")
+```
+
+`withIdleness` on a source overrides the application-wide
+`stoatflow.watermark.idleness-timeout-ms` for that source's partitions; a source that sets none inherits
+it. This is a StoatFlow extension — Kafka Streams has no `addSource(WatermarkStrategy, …)`.
+
 ## Threading — the rule that bites
 
 **One processor instance per lane** (the KS-task analog). Instance fields are per-lane and safe without

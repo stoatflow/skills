@@ -56,7 +56,14 @@ source:                       # the Kafka Streams app you migrate FROM
   ignoreStores: []                    # opt-out for deliberately-left-behind stores (e.g. a drained suppress buffer)
 target:                       # the StoatFlow app you migrate TO
   applicationId: my-sf-app
-  changelogNumPartitions: 1           # must match the SF app's config (default 1); plan/verify assert it
+  changelogNumPartitions: 3           # DEFAULT for every store; must match the SF app's EFFECTIVE count.
+                                      # plan/verify assert each store against its OWN effective count, so a
+                                      # store using Materialized.withChangelogNumPartitions(n) sets
+                                      # stores[].changelogNumPartitions to match (see the stores block).
+                                      # against live broker metadata. A store using
+                                      # Materialized.withChangelogNumPartitions(n) needs a matching value.
+                                      # The tool cannot read the app's topology, and a changelog seeded at
+                                      # the wrong count is not repairable in place.
   replicationFactor: 3
 stores:
   - ksName: order-totals              # KS store name  → changelog {ks-app}-order-totals-changelog
@@ -91,8 +98,25 @@ Legal `type` values: `kv`, `kv-timestamped`, `window`, `window-timestamped`, `wi
 | Stream-stream join window stores | `window-duplicates` |
 | LEFT/OUTER stream-stream **shared** (outer) store | `outer-join` |
 | Foreign-key-join **subscription** store | `fk-subscription` |
-| Versioned KTable (KIP-889) | `versioned` *(experimental)* |
+| Versioned KTable (KIP-889) | `versioned` *(experimental — see the tombstone note below)* |
 | Any of the above that is **headers-aware** (KIP-1271) | family type **+ `recordHeaders: true`** |
+
+> **Versioned stores: deletes are re-encoded, and must be.** Kafka Streams logs `delete(key, ts)` as a
+> Kafka **null**. StoatFlow reserves a changelog null for its retention sweep's *reclamation* tombstones
+> — with a composite `[key][ts]` changelog key, compaction can never collapse versions, so a per-version
+> null is the only thing that can bound the topic — and writes a logical delete as the 5-byte sentinel
+> `\0TOMB`. `translate` handles this for `type: versioned`; nothing is required of you. It matters only
+> if you build your own translation: passing a KS null through restores as the *removal of that version*,
+> and since a versioned `get` has no retention floor guard the key then answers with its **pre-delete
+> value** — a silent resurrection, not an error.
+>
+> **The Kafka Streams changelog topic may already be missing versions, and the tool cannot recover
+> them.** Kafka Streams' versioned changelog is a bare key with the version timestamp as the record timestamp; the log cleaner
+> keeps the *highest offset* per key, and Kafka Streams logs even a write its store rejected. So an
+> out-of-order or expired write that landed last can be the only record left for a key once the topic
+> has compacted, and the migrated store answers that older version as the latest where the KS
+> application answered the newer one. Not detectable from the changelog itself; confirmed against a
+> live cleaner. StoatFlow's own composite `[key][ts]` changelog cannot lose versions this way.
 
 > **The `kv` vs `kv-timestamped` trap (byte-silent).** StoatFlow's `table()` **source** stores and the
 > FK-join **result** store are **plain KV** — even though the *KS* equivalents are timestamped. Declaring
@@ -138,8 +162,14 @@ output StoatFlow already produced, which EOS cannot dedupe across apps. Keep KS 
   migrating a crashed ALO snapshot inherits at-least-once duplication. EOS snapshots are crash-safe.
 - **Watermark / retention boundaries.** StoatFlow's stream time is the **watermark** — at resume it
   rebuilds from live records with the configured strategy, so window closure/expiry around the boundary can
-  differ from KS by up to the out-of-orderness bound. Restored records older than retention expire on the
-  first post-restore watermark tick (same as native state).
+  differ from KS by up to the out-of-orderness bound. Restored records older than retention expire from the
+  first post-restore watermark tick onward (same as native state) — but the boundary is **not** exactly
+  `retention`: a segmented store drops a segment only once its *entire* range has cleared
+  `watermark - retention`, so records survive up to `retention + segmentInterval`. Expect that overhang on
+  both sides when diffing StoatFlow against KS record by record; KS makes the same minimum-bound promise,
+  sized `max(retention / 2, 60 s)`. Under `EmitStrategy.onWindowClose()` the overhang is larger again —
+  expiry is gated on the durable emit frontier, not the watermark — so do not treat
+  `retention + segmentInterval` as the ceiling when diffing such a topology.
 - **Logging-disabled stores** have no changelog to translate from — reprocess or accept the loss.
 - **Versioned stores are experimental** — extra `verify` scrutiny on history retention at the boundary.
 

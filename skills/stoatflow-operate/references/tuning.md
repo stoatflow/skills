@@ -51,6 +51,65 @@ Cold-start / standby restore uses dedicated consumers under `stoatflow.kafka.res
 `stoatflow.state.segment-checkpoint-{records (100000),ms (30000)}` bound ungraceful-restart replay and
 standby drain to ≤ one checkpoint interval.
 
+## Changing a windowed/session store's retention
+
+Change `retention` and restart — no restore, **on the segmented backend** (the default for every windowed
+aggregation and session store). Each segment records its own time range on disk, so a changed retention
+(and therefore segment interval) **remaps** rather than being reinterpreted. Kafka Streams requires wiping
+local state for the same change. The stream-stream join buffers are segmented too (since 2026-09-03), so
+a changed join window remaps the same way; only a hand-built non-segmented store
+keeps the interval in every key, where a retention change that moves it needs a restore.
+
+- Segments are sized `max(retention / 3, 60s, windowSize)` on every DSL window/session store
+  (`max(retention / 3, 60s)` only on a hand-built non-segmented one); not configurable. Below ~3 min of retention the
+  60 s floor governs **provided `windowSize <= 60s`** (same floor as KS, likewise unclamped — though KS
+  reaches its own floor below **120 s**, since its rule is `retention / 2`). A larger window still wins
+  on a segmented store: at `retention = 2min, windowSize = 90s` the interval is 90 s.
+- **Live segment count is watermark-dependent, and being on the floor says nothing about it.** Segments
+  are fixed-width and epoch-aligned, so the count is `retention / segmentInterval` whole intervals plus
+  the boundary one when the watermark sits on a segment edge, and `ceil(retention / segmentInterval) + 1` in the worst phase — the same number when the retention divides evenly, one higher when it does not. Size
+  against the maximum; 2 min of retention on a 60 s interval keeps three. A single segment is never
+  guaranteed — even 30 s of retention on a 60 s interval spans two off a boundary. A stalled watermark
+  accumulates more again (`RS-03`).
+- Retention is a **minimum** bound: whole segments are dropped, so effective retention lands in
+  `[retention, retention + segmentInterval)` — up to ~4/3× configured where the divisor governs
+  (`retention >= 180s`), **up to 2×** where `windowSize` governs (segmented only, and the default case
+  since `TimeWindows.ofSizeWithNoGrace` makes `retention == windowSize`), and **`retention + 60s`** where
+  the floor governs, which at 30 s retention is **3×** — the floor is ours as much as KS's, so short
+  retentions are a large multiple, not a small one. Exactly 1× in-memory. Size disk against the upper
+  bound.
+- **`EmitStrategy.onWindowClose()` adds a term the bound above does not cover.** Expiry is then gated on
+  the durable emit frontier rather than the committed watermark, so effective retention is
+  `retention + segmentInterval + (watermark - emit frontier)`. Normally small, zero-slack by design (a
+  window is never expired before its final is emitted), but **not** bounded by the retention contract.
+- Narrowing retention frees disk **gradually**: existing segments keep the span they were written with,
+  so effective retention stays at `retention + widest existing span` until they age out. One `INFO` line
+  at startup says so. Matters if retention is a deletion deadline.
+
+**Needs a full restore** (detected at startup, `WARN` naming the field and both values, then a changelog
+replay): changing the **window size**, switching **plain↔timestamped**, the **store type**
+(window ↔ session), **`retainDuplicates`** (a semantic flip — coexist vs overwrite — recorded in the layout
+stamp), or **retention on a hand-built non-segmented store**. Plan these with a deploy that can absorb
+restore time.
+
+**Watch the segment count.** `stoatflow.store.segments{store_name,store_type}` is the live number of data segments
+a segmented store holds (~7 file descriptors each, no upper bound): a plateau at
+`retention / segmentInterval + 1` is healthy; a climb means the watermark is pinned by a lagging-but-live
+partition (or an idle one whose effective idleness timeout is 0 — the source's own `withIdleness` if it
+sets one, else `watermark.idleness-timeout-ms`; the engine WARNs, naming the uncovered sources, at
+start-up) and nothing is expiring. Alert on `stoatflow_watermark_lag_ms`, which is sampled every second and
+so climbs during the stall.
+
+**No changelog to restore from?** A store with `withLoggingDisabled()`, or any store under
+`changelog.enabled: false`, refuses to start on a layout change — its local state is the only copy and
+StoatFlow will not delete it for you. The message names every affected store and the field that moved.
+Put the setting back, enable the changelog, or set `stoatflow.state.layout-mismatch: wipe-and-restore` to
+accept the loss (those stores start **empty**; remove the setting afterwards, it does not expire).
+
+State written before the segment-layout change cannot be read (old directory names carried no time
+ranges). The app refuses to start and names the remedy: delete the store's local state dir; the changelog
+restores it. One-time pre-1.0 break, no migration path.
+
 ## When to touch what (symptom → lever)
 
 | Symptom | Lever |
