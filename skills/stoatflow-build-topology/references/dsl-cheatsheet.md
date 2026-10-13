@@ -25,6 +25,12 @@ are Kafka `org.apache.kafka.common.serialization.Serde`/`Serdes`. Every operator
 | `merge` | `(KStream)` (same `StreamsBuilder`) | no |
 | `split` | `(Named)` → `BranchedKStream` | no |
 
+**`merge` lanes:** when one side comes straight from a source and the other is processed first
+(`orders.filter{…}.merge(returns)`), the source side runs on its **own** lanes and hands records to the merge
+(exact commit boundaries under EOS): one extra in-memory hop + one extra lane set. Tune that source with
+`Consumed.withNumberOfLanes(n)` if it does not need the default count. Lane declarations feeding one
+sub-topology (`Consumed`/`Grouped`/`Repartitioned`) must agree, or the build fails naming both.
+
 **Branching:** `stream.split(Named.as("router")).branch({k,v->…}, Branched.as("-high")).defaultBranch(Branched.as("-low"))`
 → `Map<String, KStream<K,V>>` keyed `router-high`, `router-low`. First-match (each record to exactly one
 branch). Inline: `Branched.withFunction(s->…, "-suffix")` / `Branched.withConsumer(s->…, "-suffix")`.
@@ -48,6 +54,10 @@ Java SAM types: `ValueMapper`, `ValueMapperWithKey`, `KeyValueMapper`, `Predicat
 - `count()` (+ `(Named)`, `(Materialized)`, `(Named, Materialized)`) → `KTable<K, Long>`
 - `reduce(Reducer<V>)` (+ `Named`/`Materialized`) → `KTable<K, V>`
 - `aggregate(Initializer<VR>, Aggregator<K,V,VR>)` (+ `Named`/`Materialized`) → `KTable<K, VR>`
+- A reducer/aggregator returning `null` **deletes the key** (emits a tombstone; the next record starts fresh) — as in
+  Kafka Streams, windowed aggregations included; a session reduce/aggregate returning `null` removes the session.
+  Windowed/session: the tombstone is emitted under `onWindowUpdate()` (default); under `onWindowClose()` the removed
+  window/session is simply never emitted
 
 **`KGroupedTable` folds** (adder + subtractor for changelog correctness):
 - `count()`
@@ -57,8 +67,9 @@ Java SAM types: `ValueMapper`, `ValueMapperWithKey`, `KeyValueMapper`, `Predicat
 
 Functional interfaces: `Initializer<VA> = () -> VA`, `Aggregator<K,V,VA> = (k,v,agg) -> agg`,
 `Reducer<V> = (agg, v) -> agg`. **Aggregators must be pure** — return a new aggregate, never mutate.
-Null (tombstone) values are ignored (don't increment `count`); `KGroupedTable.count` removes a key when its
-count reaches zero.
+Null (tombstone) values are ignored (don't increment `count`); a `KGroupedTable.count` that returns to zero stays
+stored as `0` (KS parity) — one row per group ever counted. A decrement for a group with no count stores nothing
+(tombstone forward); one for a group at `0` gives `-1` (KS) — only with a non-pure or changed `groupBy` selector.
 
 ```kotlin
 val counts: KTable<String, Long> =
@@ -74,5 +85,9 @@ val counts: KTable<String, Long> =
 - `Repartitioned.with(keySerde, valueSerde)` (for `repartition()`; multicast partitioner **throws** here)
 - `Materialized` → see `references/serdes-state-stores.md`
 - `AutoOffsetReset.earliest()/.latest()/.none()/.byDuration(d)` (KIP-1106)
-- `StreamPartitioner<K,V>` (KIP-837): `(topic,key,value,numPartitions) -> Optional<Set<Integer>>` — empty =
-  default, single = route, empty set = drop, multiple = multicast **on sinks only**. Lives in `topology/`.
+- `StreamPartitioner<K,V>` (KIP-837): returns `Optional<Set<Integer>>` — empty = default, single = route, empty
+  set = drop, multiple = multicast **on sinks only**. Lives in `topology/`. KS 4.4 shape (KIP-1321): StoatFlow calls
+  the default `partitions(topic,key,value,headers,numPartitions)` with the record's headers; override it in a
+  **class** to route by headers. The 4-arg `(topic,key,value,numPartitions)` stays the single abstract method (a
+  lambda still works, never sees headers, and gets a deprecated-for-removal warning). On `repartition()`
+  `numPartitions` = the lane count; route each (key, headers) to one lane consistently before a stateful operator.

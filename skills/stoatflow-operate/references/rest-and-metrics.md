@@ -8,13 +8,13 @@ Read endpoints are `GET` (wrong method → 405; pre-startup → 503). **Expose o
 |---|---|---|
 | `/health/live` | GET | Liveness — process healthy enough to stay alive? (200 UP / 503 DOWN). Flips DOWN if the commit pipeline freezes past `stoatflow.commit-stall.threshold-ms` (45 s). License never fails liveness. |
 | `/health/ready` | GET | Readiness — ready to process? 503 throughout restoration + the ~5-min license `PENDING` window. |
-| `/info` | GET | App id, JVM/Kafka info, uptime, state, registered endpoints. |
+| `/info` | GET | App id and effective lane count (`app.lanes`), JVM/Kafka info, uptime, state, registered endpoints. |
 | `/config` | GET | Merged effective config, secrets masked (YAML; JSON via `Accept`). |
-| `/topology` `/topology/ks` `/topology/compiled` | GET | Native view · Kafka-Streams-compatible `describe()` view · compiled internal view. |
+| `/topology` `/topology/ks` `/topology/compiled` | GET | Native view · Kafka-Streams-compatible `describe()` view · compiled internal view. `/topology/ks` (JSON with `Accept: application/json`) is the pull equivalent of KS 4.4's KIP-1331 topology-description push — StoatFlow is a classic consumer group, so `describeStreamsGroups` never lists it (KSC-113). |
 | `/state` | GET | Lifecycle state + transition history. |
-| `/consumer` | GET | Consumer-group metadata, subscription, last commit time, per-partition buffer + pause state. |
+| `/consumer` | GET | Consumer-group metadata, subscription, last commit time, per-partition buffer + pause state (`paused` for any reason: full buffer, watermark alignment, the application pause, start-up restoration). |
 | `/offsets` | GET | Per-partition committed source offsets + lag, and committed changelog offsets per store. |
-| `/watermarks` | GET | Global + per-partition event-time watermarks, idle flags, last event times. |
+| `/watermarks` | GET | Global + per-partition event-time watermarks, idle flags, last event times. A partition whose next record is stamped in the future and held behind older records also shows `previewWatermarkMs` (what it counts with in the global watermark, while that is above its own) and `headHeldSinceMs`. |
 | `/license` | GET | Runtime license-validation state. |
 | `/pause` `/unpause` | POST | Pause (→ `DRAINING` → `PAUSED`, readiness DOWN, no rebalance) / resume (→ `RUNNING`). Wrong state → 400. |
 | `/ha/status` | GET | HA cluster view (only when `ha.mode != off`; else 404). |
@@ -57,12 +57,16 @@ runtime:
       shape: micrometer-binder # micrometer-binder | jmx-exporter
 ```
 
+In the Kafka Streams naming modes, store `commit-rate` / `commit-latency-{avg,max}` (debug) map from the per-store
+epoch flush timer — StoatFlow commits every store at every barrier, so the rate is the barrier rate — and task
+`restore-remaining-records-total` sums `stoatflow.restoration.remaining.records`.
+
 Main metric families (level `info`): throughput/latency (`stoatflow.lane.records.processed.total`,
 `stoatflow.lane.process.latency`, `stoatflow.e2e.latency`), barrier commits
-(`stoatflow.barrier.{completed,failed}.total`, `stoatflow.barrier.commit.latency`,
+(`stoatflow.barrier.{completed,failed,abandoned}.total` — abandoned = deliberately not committed, `reason` `pre_assignment`/`poison_abort`/`abort_teardown`/`not_broadcast`, not a failure; `failed`'s `error_type` `fatal_error` = an `Error` (`TODO()`, `AssertionError`) thrown by user serde/store code during a commit — `stoatflow.barrier.commit.latency`,
 `stoatflow.barrier.trigger.total{TIME,RECORD_COUNT,MEMORY_PRESSURE,CACHE_PRESSURE}`), watermarks
-(`stoatflow.watermark.{current,lag.ms,late.records.total}`), changelog/restoration
-(`stoatflow.restoration.{in.progress,records.restored.total}`), consumer/producer
+(`stoatflow.watermark.{current,lag.ms,late.records.total,preview.partitions}`), changelog/restoration
+(`stoatflow.restoration.{in.progress,records.restored.total}`; `stoatflow.restoration.remaining.records{store_name}` — records a store still has to restore, 0 once done), consumer/producer
 (`stoatflow.consumer.lag.records`; `stoatflow.consumer.partition.forgotten.total{reason}` — source partitions
 dropped because their topic is gone (`topic_deleted` = a deleted pattern topic, answered by an in-place engine
 restart; `ha_source_shrink` = the HA detector's confirmed shrink);
@@ -70,6 +74,15 @@ restart; `ha_source_shrink` = the HA detector's confirmed shrink);
 currently matches, `0` = matches nothing yet), client state (`stoatflow.client.state` — ordinal, `== 4` = RUNNING =
 healthy-and-processing), HA (`stoatflow.ha.*`, only when on), and license
 (`stoatflow.license.valid{tier}`). JVM/Kafka-client metrics via `bind-jvm-metrics` (default true).
+
+**`stoatflow.timer.lane.mismatch.total{processor}`** — record keys whose re-serialization with the processor's timer
+key serde picks another lane than the record's, so the key's timers would run on another lane than its records.
+Pre-registered at 0 per timer-declaring Processor API processor. A split for a timer on the record's own key stops the
+app by default (`TimerLaneAffinityException`, `timer.lane-affinity.guard`); a sampled split is WARN-only by default
+(`timer.lane-affinity.sampled-check`). Alert on any increase AND on application state — a fatal detection can stop the
+app before the next scrape. Recorded at every level. The fix is a
+declared key serde — `Topology.addSource(name, Consumed.with(keySerde, valueSerde), topics)` instead of a key
+deserializer — never a restart.
 
 **RocksDB (`stoatflow.rocksdb.*`) is opt-in and two-gated:** `stoatflow.rocks-db.metrics.enabled: true`
 gives the property + cache gauges (`info`, cheap); adding `statistics-enabled: true` gives the ticker /
@@ -114,8 +127,10 @@ caveats: `open.files` is not published (its RocksDB ticker is gone in the bundle
   record was preserved, not dropped).
 - `stoatflow.dlq.abort.dropped.records` was **retired** (ADR-140). It counted the source records an abort
   permanently dropped; aborts no longer drop them.
-- `stoatflow.dropped.records.total{reason}` — six reasons: `null_key`, `late_window`, `late_session`,
-  `join_null_key`, `join_null_value`, `table_source_null_key`. The tag *is* the semantics — always group
+- `stoatflow.dropped.records.total{reason}` — seven reasons: `null_key`, `late_window`, `late_session`,
+  `join_null_key`, `join_null_value`, `table_source_null_key`, `null_window_value` (a time or sliding window whose value
+  the value serde reads back as `null`: its final `OnWindowClose` result is not emitted, counted once at close — a
+  session in that state is forwarded as `null`, as in Kafka Streams). The tag *is* the semantics — always group
   by it rather than alerting on the bare total.
 - Store operation latency is `stoatflow.store.{get,put,delete,range,all,flush}.latency` (all `debug`).
 - `stoatflow.store.segments{store_name,store_type}` (`info`) — live RocksDB instances a **segmented**
@@ -130,6 +145,13 @@ caveats: `open.files` is not published (its RocksDB ticker is gone in the bundle
   the watermark advanced** (until 2026-09-03 it was written only on an advance, so it froze at a healthy
   value during exactly the stall it exists to reveal); `-1` until the first watermark. Alert on it, and
   read the segment gauge to see which stores are paying for the stall.
+- `stoatflow.watermark.preview.partitions` (`info`) — partitions whose next record waits behind older records of other
+  partitions: a record stamped in the future, or a partition far ahead during a skewed catch-up or replay. With the
+  built-in watermark strategies such a partition counts towards the global watermark as if that record had been
+  processed, so it does **not** stall event time. Idle partitions are not counted, nor one whose own watermark is
+  already as high. Non-zero for long with no catch-up
+  under way usually means a producer clock or a timestamp unit needs checking (`/watermarks` names the partition). It
+  can also read non-zero while the application is paused or fully backpressured with such a record waiting.
 - `stoatflow.store.versioned.sweep.lag.ms{store_name}` — ms since a versioned (KIP-889) store's last
   **completed** history-reclamation pass. Versioned retention is a *minimum* bound: reads stop answering
   for expired versions immediately, but the bytes go on a rolling sweep targeting one
@@ -170,7 +192,25 @@ caveats: `open.files` is not published (its RocksDB ticker is gone in the bundle
 **Headline alerts:**
 
 - `rate(stoatflow_barrier_failed_total[5m]) > 0` — commit failures (Critical).
+- `increase(stoatflow_epoch_invariant_violations_total[5m]) > 0` — an epoch-isolation invariant tripwire fired
+  (`kind` names which; most kinds guard exactly-once, `skipped_commit_with_pending` and `partition_offset_regression`
+  both guarantees; `partition_offset_regression` also counts each broker-side seek-back — log truncation, an offset
+  reset — after which the re-fetched records are processed again; `partition_buffer_over_bound` means a poll delivered
+  records to a partition whose input buffer was already full — the pause that bounds its memory failed, usually logged
+  just before it; the records are fetched again later, so memory stays bounded; the five `timer_*` kinds —
+  `timer_claim_without_slot`, `timer_claim_while_firing`, `timer_registry_not_empty_at_reload`,
+  `timer_event_without_handler`, `timer_claim_behind_queue_epoch` — guard the in-flight timer registry, both
+  guarantees). Otherwise unreachable by design: any increment is a StoatFlow bug — capture the ERROR (or, for
+  `partition_offset_regression` and `partition_buffer_over_bound`, WARN) log line and report it (Critical).
 - `stoatflow_license_valid == 0` **`for: 10m`** — the `for` matters: every deploy reads 0 during the ~5-min
   license `PENDING` window (Critical).
 - `max(stoatflow_consumer_lag_records) > 100000` — high lag.
-- watermark stall / backpressure / HA standby lag / redundancy below desired.
+- watermark stall / backpressure / HA standby lag / redundancy below desired. A record stamped far in the future at a
+  partition's head waits there while other partitions are backlogged; the log carries a WARN naming the partition
+  ("stamped … ms in the future at its head"). With the built-in watermark strategies the partition waits but event
+  time does not — the WARN says event time is set by the other partitions, and `stoatflow.watermark.preview.partitions`
+  counts it. With a custom `WatermarkGenerator` the WARN says the watermark stands still instead: event time is pinned
+  until the record is processed or the partition goes idle (`watermark.idleness-timeout-ms`). A WARN saying the record
+  is stamped "… ms ahead of the wall clock" instead means nothing is held back (a single partition, or every partition
+  ahead): event time follows suspect timestamps — check the producer clock, LogAppendTime on a broker clock that runs
+  ahead, or the timestamp extractor's unit.

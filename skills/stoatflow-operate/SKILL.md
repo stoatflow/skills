@@ -112,6 +112,11 @@ watermark stall.
       standbys); never two active against the same topics.
 - [ ] Stable `application-id`; graceful shutdown on SIGTERM.
 - [ ] PVC for warm restart; recovery point = the last committed barrier.
+- [ ] Pre-creating topics (`changelog.create-topics-if-not-exist: false`)? Create every store's
+      `<app>-<store>-changelog` **and** the engine's own, which `describe()` does not list:
+      `<app>-stoatflow-watermark-changelog` (1 partition; any windowed aggregation, time-based `suppress` or
+      stream-stream join), `<app>-<store>-emitfrontier-changelog` per `onWindowClose()` aggregation,
+      `<app>-timer-store-changelog` for Processor API timers. Startup names any that is missing.
 - [ ] Processing guarantee chosen on purpose; downstream consumers match.
 - [ ] License injected as a secret; readiness wired to license health.
 - [ ] `/health/ready` (readiness) + `/health/live` (liveness) + a generous `startupProbe`.

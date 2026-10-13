@@ -91,8 +91,8 @@ Legal `type` values: `kv`, `kv-timestamped`, `window`, `window-timestamped`, `wi
 | KS DSL operation / store | `type` |
 |---|---|
 | `count` / `reduce` / `aggregate` (KTable aggregation) | `kv-timestamped` |
-| `builder.table(...)` **source** store | **`kv`** (plain — see the trap below) |
-| Foreign-key-join **result** store | **`kv`** |
+| `builder.table(...)` source / `toTable()` / `KTable` operator store | `kv-timestamped` |
+| Foreign-key-join or table-table join **result** store | `kv-timestamped` |
 | `windowedBy(TimeWindows/SlidingWindows).aggregate` | `window-timestamped` |
 | `windowedBy(SessionWindows).aggregate` | `session` |
 | Stream-stream join window stores | `window-duplicates` |
@@ -118,21 +118,24 @@ Legal `type` values: `kv`, `kv-timestamped`, `window`, `window-timestamped`, `wi
 > application answered the newer one. Not detectable from the changelog itself; confirmed against a
 > live cleaner. StoatFlow's own composite `[key][ts]` changelog cannot lose versions this way.
 
-> **The `kv` vs `kv-timestamped` trap (byte-silent).** StoatFlow's `table()` **source** stores and the
-> FK-join **result** store are **plain KV** — even though the *KS* equivalents are timestamped. Declaring
-> `kv-timestamped` for one of these prepends a timestamp the StoatFlow store reads as value bytes →
-> **silent corruption**. When in doubt, `plan`'s heuristics can't fully catch this (plain and timestamped
-> KV changelogs are wire-identical) — the **post-start IQ spot-check catches it end to end**.
+> **The `kv` vs `kv-timestamped` trap (byte-silent).** Every StoatFlow DSL key-value store is timestamped,
+> as in KS — so every DSL KV store is `kv-timestamped`; `kv` is only for a Processor API store you built
+> plain. A mismatch either way is **silent corruption** (a prepended timestamp read as value bytes, or a
+> value too short to hold one). `plan`'s heuristics can't catch it (KS writes bare values for both) — the
+> **post-start IQ spot-check catches it end to end**.
 
 **Source-KTable stores** are conditional: a **compacted** source topic restores for free (omit the store
-from `stores`); a **non-compacted** source needs the changelog translated as `kv`, or the ported code to
+from `stores`); a **non-compacted** source needs the changelog translated as `kv-timestamped`, or the ported code to
 force `Consumed.materializeFromSourceTopic(true)`. `plan` resolves and prints the path per store.
 
 ## Cutover runbook
 
-1. **Prepare (KS running):** port the code; name all migrated stores explicitly; mark OnWindowClose
-   aggregation stores `emitFrontier: true`; write `migration.yaml`; dry-run `plan` (expect "group not
-   empty" — everything else validates).
+1. **Prepare (KS running):** port the code; name all migrated stores explicitly; build the ported topology
+   once with `topology.validation.declared-serde-over-default=error` (a `TopologyTestDriver` run suffices) and
+   declare the serde at every site it lists — StoatFlow uses an upstream serde where KS used a differing
+   default at `groupByKey(Grouped)`, stream-stream joins, cogroup and `merge`, and the tool copies KS's bytes
+   without seeing the app's serdes; mark OnWindowClose aggregation stores `emitFrontier: true`; write
+   `migration.yaml`; dry-run `plan` (expect "group not empty" — everything else validates).
 2. **Quiesce:** stop input production if the SLA requires; let KS drain repartition topics; if suppress is
    in play, reach a windows-closed point so the buffer drains; cleanly stop KS (group → EMPTY). **Under
    ALO, a clean shutdown is mandatory** — never migrate a crashed ALO snapshot.

@@ -8,7 +8,9 @@ StoatFlow keeps a **typed** config model (`StreamsConfig` data class + `Builder`
 - **Entry points:** `StreamsConfig.fromProperties(props).build()` / `StreamsConfig.fromMap(map).build()`.
   The KS-faithful ctors `new StreamsConfig(props)` / `new StreamsConfig(map)` (KSC-79) delegate to
   `fromMap(...).build()`. A missing `application.id` throws `IllegalArgumentException` (KS throws
-  `ConfigException`). `StreamsConfig.toProperties()` emits the resolved, masked config back as KS-keyed
+  `ConfigException`). `application.server` is validated at construction (`host:port`, `protocol://host:port`,
+  `[ipv6]:port` or blank) and a malformed value throws `IllegalArgumentException` — Kafka Streams 4.4 does
+  the same (with `ConfigException`). `StreamsConfig.toProperties()` emits the resolved, masked config back as KS-keyed
   `Properties` (for `/config` / diffing).
 - **Coverage — the ~74-key KS-4.3.0 overlap:** typed mappings, class-name pluggables (serdes, the three
   exception handlers, `default.client.supplier`, `rocksdb.config.setter`), and client prefixes
@@ -36,6 +38,9 @@ StoatFlow keeps a **typed** config model (`StreamsConfig` data class + `Builder`
   kafka-clients' `logUnused`, and it does not run at all under `TopologyTestDriver`). Opt-in
   **`stoatflow.config.strict`** makes those truly-unknown keys **throw** instead — the documented opt-out
   from custom-prop forwarding. Recognised KS keys and client keys never throw. Default is lenient.
+- **`topology.description.push.enabled`** (KS 4.4, KIP-1331) is a recognised no-op: the push needs the streams
+  group protocol and StoatFlow is a classic consumer group. It WARNs once and is dropped (never forwarded, never
+  throws under strict). The same topology description is a pull from `GET /topology/ks` (KSC-113).
 
 - **`processor.wrapper.class` (KIP-1112)** is supported (ADR-118 Batch-14): the named
   `io.stoatflow.core.processor.ProcessorWrapper` is instantiated at ingestion and handed the raw config map

@@ -1,6 +1,6 @@
 ---
 name: stoatflow-test
-description: Write or debug tests for StoatFlow topologies. TopologyTestDriver unit tests (pipe input, read output, advance watermarks, commitBarrier, assert state stores), the serde round-trip and per-pipe flush behaviour, StoatFlowTestDriver config-driven tests, and real-broker integration tests. Use for testing StoatFlow topologies; for writing the topology itself use stoatflow-build-topology.
+description: Write or debug tests for StoatFlow topologies. TopologyTestDriver unit tests (pipe input, read output, advance watermarks, commitBarrier, assert state stores), the serde round-trip and per-pipe commit behaviour, StoatFlowTestDriver config-driven tests, and real-broker integration tests. Use for testing StoatFlow topologies; for writing the topology itself use stoatflow-build-topology.
 license: Apache-2.0
 ---
 
@@ -8,7 +8,7 @@ license: Apache-2.0
 
 Read `references/stoatflow-primer.md` first. Testing is where StoatFlow's Kafka-Streams source-compat is
 most seductive and most divergent — the `TopologyTestDriver` API matches KS, but its *timing* semantics
-(serde enforcement, per-pipe flush, watermark model) differ in ways a KS-trained assistant gets wrong.
+(serde enforcement, per-pipe commit, caching that never consolidates, watermark model) differ in ways a KS-trained assistant gets wrong.
 
 Two levels:
 
@@ -56,11 +56,12 @@ driver.close()
   `readKeyValuesToMap()` (last value per key) / `getQueueSize()` / `isEmpty()`.
 - **Time:** `advanceWatermark(long)` (event time — fires ET timers, closes windows, flushes suppress),
   `advanceWallClockTime(Duration)` (processing time — fires WC punctuators/scheduled sources, then
-  commits), `commitBarrier()` (flush caching-store emissions), `triggerScheduledSource(name)`.
-- **State:** `getKeyValueStore(name)` (unwraps timestamped → raw `V`), `getWindowStore`,
+  commits; it is also what `currentSystemTimeMs()` / `currentProcessingTime()` return in your code), `commitBarrier()` (commit the epoch + flush barrier-gated suppress), `triggerScheduledSource(name)`.
+- **State:** `getKeyValueStore(name)` (unwraps timestamped and headers-aware → raw `V`), `getWindowStore`,
   `getSessionStore`, `getTimestampedKeyValueStore`, `getVersionedKeyValueStore`, the `*WithHeaders`
   variants, generic `getStateStore(name)`, `getAllStateStores()`, `producedTopicNames()`.
-- `TestRecord(key, value, headers, timestamp)` — KS positional order.
+- `TestRecord(key, value, headers, timestamp)` — KS positional order; the timestamp is unset by default, and
+  `pipeInput(record)` then takes the input topic's current time (KS parity).
 
 `TopologyTestDriver` is **not thread-safe** — one instance per test (`@BeforeEach` create, `@AfterEach`
 close).
@@ -70,14 +71,18 @@ close).
 - **Serdes are enforced** at the source/sink boundary (KSC-62) — the `createInputTopic`/`createOutputTopic`
   serdes are applied, matching the real engine. Wrong/asymmetric serdes throw (they used to be silently
   ignored). A correctly-typed KS test is unaffected.
-- **Per-pipe cache flush** (KSC-63) — `pipeInput` commits per pipe, so a caching `count()`/`aggregate()`
-  emits **every intermediate update** with no manual `commitBarrier()`. Piping `(k,1),(k,2),(k,3)` emits
-  `1,2,3`, not a single deduped `(k,3)`.
+- **Caching never consolidates** (KSC-63, KSC-88) — every update is forwarded when it happens, caching on or
+  off, exactly as the engine does. Piping `(k,1),(k,2),(k,3)` into `count()` emits `1,2,3`, never a deduped
+  `(k,3)` — even with `test.driver.commit-per-pipe=false`. `pipeInput` commits per pipe (stores, changelogs).
+  One emission per key per commit = `suppress(Suppressed.untilBarrier())` or `emit.mode: on-barrier`.
 - **Per-pipe stream-time advance** (KSC-71) — `pipeInput` advances stream-time to the record's event-time,
   so stream-stream unmatched results, `OnWindowClose`, and `suppress(untilWindowCloses)` flush on a
   later-timestamped pipe, **without** an explicit `advanceWatermark`.
 - **Opt-out:** `test.driver.commit-per-pipe=false` (test-harness only) reverts to legacy manual control
   (you drive `commitBarrier()` / `advanceWatermark()` yourself).
+- **Headers-aware stores:** a write through the plain accessors (`put`, `compute`, `merge`) stores empty headers,
+  as in KS; `test.driver.keep-existing-headers=true` (test-harness only) keeps an existing entry's headers instead
+  (not on a duplicate-retaining window store, where a `put` appends — the driver WARNs).
 - **`advanceWatermark`** is lenient by default (a backward request is a silent no-op); strict (forward-only
   throw) under manual mode.
 
@@ -89,9 +94,20 @@ The TTD is a **fidelity approximation**, not the engine:
   keeps `BoundedOutOfOrderness(10s)` lag + a `min`-across-partitions global watermark. **A window-close /
   join test that passes in the TTD emits *later* in production** under default config. To make production
   match, use `forMonotonousTimestamps()` / `maxOutOfOrderness=0` and mind per-partition idleness.
+- **Chained windows close later in production.** A window fed by another window's finals across a re-key runs
+  ~2 commit intervals behind per step on a broker; the TTD (one sub-topology) has no such lag. A graceful shutdown
+  emits every window the watermark has closed, in every step; one still open is emitted after the next start.
+- **Pipe tables in event time too.** The TTD watermark is the max over **every** piped topic and it decides
+  lateness (ADR-149), so a KTable record piped with no timestamp (wall clock) makes older stream records late
+  — they are dropped. Pass the same event-time timestamps to the table's `pipeInput`.
 - **In-memory only.** All stores (even RocksDB-`Materialized`) run as in-memory twins; **no changelog** is
   written. Changelog/restoration, **EOS transactional commits**, and cross-key/lane ordering are
   **structurally invisible** to the TTD — test those with a real broker.
+- **…but the exactly-once store checks judge the DECLARED store** (KSC-126). A table a join reads from another lane
+  declared `Stores.persistentVersionedKeyValueStore` passes (the driver runs its in-memory twin); one declared
+  `Stores.inMemoryVersionedKeyValueStore` or `Stores.lruMap` is refused under `exactly_once` (the default) — at driver
+  construction, exactly as the engine refuses it. A PK or GlobalKTable join test over a versioned table that fails to
+  build: declare the RocksDB versioned store (or run the test `at_least_once`).
 - **Boundary key serialization IS reproduced** (record path AND window-close/suppress/punctuator
   emissions): a key crossing a sub-topology boundary — where a re-keyed record reaches an aggregation,
   a join, `toTable()`, or an explicit `repartition()` (ADR-138; a re-key alone opens no boundary, and
@@ -140,8 +156,8 @@ general Testcontainers pattern.
 ## Hard rules
 
 - **Configure serdes explicitly** — the TTD enforces them like the engine (KSC-62).
-- **Don't expect a caching aggregation to dedupe in the TTD** — expect per-pipe emissions (KSC-63), or
-  assert the store's final value.
+- **Don't expect caching to dedupe** — in the TTD or in production (KSC-88). Expect every update, assert the
+  store's final value, or add `untilBarrier()` / `emit.mode: on-barrier` and drive `commitBarrier()`.
 - **Don't assume TTD timing == production timing** — the watermark lag differs; test EOS/restoration with a
   real broker.
 - **Don't invent an `integration-test-utils` dependency** — it doesn't exist yet.

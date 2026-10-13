@@ -10,7 +10,8 @@ Read `references/stoatflow-primer.md` first — the identity rules there (never 
 `org.apache.kafka.streams.*`, never depend on `kafka-streams`, EXACTLY_ONCE default, single-instance
 scaling) are exactly what a Kafka-Streams-trained assistant gets wrong on a port.
 
-StoatFlow reimplements the **Kafka Streams 4.3** DSL/API surface under `io.stoatflow.core.*` and depends
+StoatFlow reimplements the **Kafka Streams 4.3** DSL/API surface (with a few Kafka Streams 4.4 additions already in —
+e.g. `CloseOptions.GroupMembershipOperation.DEFAULT`, KSC-112) under `io.stoatflow.core.*` and depends
 on **`kafka-clients` only**. A port is therefore mostly a **mechanical import rewrite** plus a short,
 enumerated list of intentional divergences (the register). Binary compatibility (dropping in the real
 `kafka-streams` jar) is **not** pursued and never will be.
@@ -72,15 +73,17 @@ Replace the package prefix and **collapse the KS sub-package**. `StreamsBuilder`
 | `org.apache.kafka.streams.Topology` | `io.stoatflow.core.topology.Topology` |
 | `org.apache.kafka.streams.KeyValue` | `io.stoatflow.core.state.KeyValue` |
 | `org.apache.kafka.streams.KafkaStreams.State` | `io.stoatflow.core.KafkaStreamsState` |
-| `org.apache.kafka.streams.CloseOptions` | `io.stoatflow.core.CloseOptions` |
+| `org.apache.kafka.streams.CloseOptions` | `io.stoatflow.core.CloseOptions` (KS 4.4 shape incl. `GroupMembershipOperation.DEFAULT` — follows `leaveGroupOnClose`, KSC-112) |
 
 `org.apache.kafka.common.*` and `org.apache.kafka.clients.*` (serdes, `Headers`, `ConsumerRecord`,
 `ProducerRecord`, …) are **unchanged** — those are `kafka-clients` types StoatFlow uses directly.
 
 A handful of `processor.*` types mis-route under the blind swap (they don't live under
 `io.stoatflow.core.processor.`) — `StreamPartitioner`, `StateStore`, `TimestampExtractor`,
-`TopicNameExtractor`, `RecordContext`, `TaskId`, `RocksDBConfigSetter`. The recipe rewrites them; by hand,
-fix them per `references/divergences.md`.
+`TopicNameExtractor`, `RecordContext`, `TaskId`, `RocksDBConfigSetter` — and two KS `internals` types that
+are public in StoatFlow: `processor.internals.NoOpProcessorWrapper` → `io.stoatflow.core.processor`, and
+`state.internals.StateStoreProvider` (the first parameter of a custom `QueryableStoreType.create`) →
+`io.stoatflow.core.state`. The recipe rewrites them; by hand, fix them per `references/divergences.md`.
 
 ## §2 — The residual fixes (full table in references/divergences.md)
 
@@ -94,7 +97,12 @@ typical port always hits:
   A ported app that relied on the KS default **silently changes semantics**. Set `at_least_once`
   explicitly if that's what you want.
 - **`StreamPartitioner` (KSC-34):** lives in `io.stoatflow.core.topology`, not `processor`. Multicast on
-  `repartition()` throws (single-instance) — multicast only on sinks.
+  `repartition()` throws (single-instance) — multicast only on sinks. KS 4.4 shape (KIP-1321): a class overriding
+  the 5-arg `partitions(..., headers, numPartitions)` is called with the record's headers; 4-arg lambdas compile.
+- **Header-aware serialisation (KSC-103):** keys and values are serialized with the record's headers at the sink,
+  the in-memory repartition and `queryMetadataForKey` — as Kafka Streams serialises sinks, so a port's sink placement
+  is unchanged. `queryMetadataForKey(..., partitioner)` throws on `Optional.empty()`/out-of-range and passes
+  `value = null` (declare the partitioner's `V` nullable).
 - **Exception handlers (KSC-01):** `ProcessingExceptionHandler` takes a `processor.Record<*,*>`, not
   separate key/value; production serialization errors fold into `handle(...)` (branch on
   `(context as ProductionContext).failedOn`).

@@ -36,8 +36,25 @@ StoatFlow type. Resolution: explicit serde on the operator config (`Consumed`/`P
 - Defaults in code: `streamsConfigOverrides { defaultKeySerde(...); defaultValueSerde(...) }`; or YAML
   `stoatflow.default-key-serde` / `default-value-serde` (FQ class name, no-arg ctor only). Code wins.
 - Built-ins: `Serdes.String()/Long()/Integer()/Short()/Float()/Double()/ByteArray()/ByteBuffer()/Bytes()/UUID()/Void()`.
-- Custom: implement `Serde<T>`, or `Serdes.serdeFrom(serializer, deserializer)`.
+- Custom: implement `Serde<T>`, or `Serdes.serdeFrom(serializer, deserializer)`. A (de)serializer
+  *instance* passed to the Processor API (`addSource`/`addSink`) is called concurrently by the dispatcher, parallel
+  deser and every lane, so it must be thread-safe (KS shares it across tasks too, but its default single stream thread
+  never calls it concurrently); a serde (declared or default) is asked for `deserializer()`/`serializer()` per call.
 - **A serde must round-trip `null` cleanly** (return `null` for `null`) — tombstones depend on it.
+- **Headers reach the serde in both directions** (KS parity): sources call `deserialize(topic, headers, data)`;
+  the sink key + value, the boundary key bytes above and `queryMetadataForKey` call `serialize(topic, headers, data)`
+  (KIP-1321) — exactly as Kafka Streams serialises sinks, so a port places records as on KS. Header-agnostic serdes are
+  byte-identical, and Confluent's schema id in headers (`HeaderSchemaIdSerializer`, which needs non-null headers)
+  works. Headers are the record's own, shared by its sinks as in KS, so a header-writing serializer's additions are
+  visible to a sibling sink and to later processors. A record crossing an in-memory sub-topology boundary (`repartition()`,
+  or a re-key followed by an aggregation, join or `toTable()`) gets its own copy of the headers there, as a KS
+  repartition topic gives each record its own — what is added after the boundary is not visible before it. Exception,
+  as in KS: the boundary KEY is serialized with the record's own headers before the copy, so a key serializer's header
+  (Confluent header mode) is visible upstream too. At a `repartition()` boundary advise against a key serde whose bytes depend on header **contents** (one key
+  would spread over several lanes of one global store, and away from its timers) — the user's responsibility; serdes
+  that only add a header keep one lane per key, but a Confluent header-mode **key** serde cannot key a state
+  store or a Processor API timer yet (roadmap `timer-headers`). Switching a **key** serializer from Confluent's prefix to header mode changes the
+  key bytes, hence partitions, in any client (Confluent's warning) — keep keys in prefix mode or treat it as a re-key.
 - **Avro:** no StoatFlow serde — use Confluent `SpecificAvroSerde`. `stoatflow.schema-registry-url` in YAML
   propagates only to *default* serdes; per-operator Avro serdes must be `configure(mapOf("schema.registry.url" to url), isKey)`
   by hand. Pin Apache `kafka-clients` (Confluent pulls `-ccs`). Tests use `mock://…`.
@@ -47,7 +64,7 @@ StoatFlow type. Resolution: explicit serde on the operator config (`Consumed`/`P
 | Store | Persistent (RocksDB, default) | In-memory |
 |---|---|---|
 | Key-value | `persistentKeyValueStore(name)` | `inMemoryKeyValueStore(name)` |
-| LRU | — | `lruMap(name, maxCacheSize)` |
+| LRU | — | `lruMap(name, maxCacheSize)` — no commit buffer (see Notes); under `exactly_once` not a table a join reads from another lane (`KSC-126`) |
 | Window | `persistentWindowStore(name, retention, windowSize)` | `inMemoryWindowStore(...)` |
 | Session | `persistentSessionStore(name, retention)` | `inMemorySessionStore(name, retention[, expiryIndex])` 🆕 third param |
 | Timestamped KV (KIP-258) | `persistentTimestampedKeyValueStore(name)` | `inMemoryTimestampedKeyValueStore(name)` |
@@ -56,7 +73,18 @@ StoatFlow type. Resolution: explicit serde on the operator config (`Consumed`/`P
 
 Durations are `java.time.Duration`; window/session retention ≥ window size; names match `[a-zA-Z0-9._-]`.
 Store builders: `Stores.keyValueStoreBuilder(supplier, keySerde, valueSerde)` (+ `windowStoreBuilder`/
-`sessionStoreBuilder`/`versionedKeyValueStoreBuilder`).
+`sessionStoreBuilder`/`versionedKeyValueStoreBuilder`). A hand-written `StateStoreBuilder` must report
+`isTimestamped = true` exactly when its `build()` returns a timestamped store (`TimestampedKeyValueStore`/
+`TimestampedWindowStore` or a headers twin), and a custom supplier behind `Materialized.as(...)` on a timestamped
+aggregation (`count()`, `aggregate()`, …) must build a timestamped store — otherwise startup fails with
+`TopologyValidationException`, before any store opens. `Stores.*` builders always comply. A hand-written
+`StateStoreBuilder` must also not return a persistent supplier's `get()` (`Stores.persistentKeyValueStore(..).get()`,
+or the timestamped/window/session equivalent): that byte-level RocksDB store has no epoch lifecycle wired, so startup
+refuses it with `TopologyValidationException` (KSC-124). Pass the supplier to `Stores.*StoreBuilder(supplier, …)` or
+`Materialized.as(supplier)`. In-memory and LRU `get()` stores are fine. A hand-written **versioned** builder that builds
+a persistent store must override `toInMemoryBuilder()` to return its in-memory twin: the default returns the builder
+itself, which StoatFlow reads as an in-memory store — refused under `exactly_once` as a table a join reads from another
+lane (`KSC-126`).
 
 **In-memory session store expiry (StoatFlow-only `expiryIndex`).** The in-memory session store's map is
 key-first, so its default expiry pass walks every live session on every watermark advance (~50 ns each in the
@@ -128,7 +156,14 @@ operational side.
 Store handles: `KeyValueStore<K,V>` (`get`/`put`/`delete`, atomic `compute(key, fn)` / `merge(key, value, fn)`);
 **to delete a key, write `put(key, null)` unless you need the previous value** — `delete()` returns it, so it
 reads (and deserialises) it first; `put(key, null)` is the same tombstone without the read, and it is what
-both StoatFlow's DSL and Kafka Streams do internally (https://stoatflow.io/docs/building/state-stores#deleting-a-key);
+both StoatFlow's DSL and Kafka Streams do internally (https://stoatflow.io/docs/building/state-stores#deleting-a-key).
+On a timestamped store a **null value is an absent entry** (Kafka Streams parity): a `ValueAndTimestamp` whose value is
+`null` is written as a delete, a value your deserializer maps to `null` reads back as `null`, and
+`ValueAndTimestamp.make(null, ts)` returns `null` (`makeAllowNullable` returns an instance); `merge` rejects a null-valued
+input (`IllegalArgumentException`, like `Map.merge`) — delete with `put(key, null)` — and a `null` remapping
+result deletes; `putIfAbsent(key, null)` writes nothing; window `put(key, null, windowStart)` deletes the window;
+session `put(session, null)` removes the session (`put`/`putIfAbsent` take `null` from Kotlin and Java, as in KS;
+`merge` needs a value, like `Map.merge`);
 read-only `ReadOnlyKeyValueStore` (`get`, `containsKey`, `all`/`reverseAll`, `range`/`reverseRange`,
 `prefixScan(prefix, serializer)`, `approximateNumEntries`); `KeyValueIterator` is `Closeable`. Range bounds
 are KS-exact (KIP-763): a null bound is open-ended (both null ≡ `all()`), `reverseRange` takes ascending
@@ -137,9 +172,47 @@ WARN — the same rules apply to the window/session key-range queries (`fetch(ke
 `findSessions(keyFrom, keyTo, …)`).
 
 **Notes:** RocksDB is default/recommended; in-memory still writes a changelog (durable via replay) unless
-`withLoggingDisabled()` (then unrecoverable after a crash). Caching only affects downstream *emissions*
-(the changelog compacts to the final value per barrier); `withCachingDisabled()` emits every intermediate.
+`withLoggingDisabled()` (then unrecoverable after a crash). Caching is always on (every non-LRU store batches its
+writes per commit — EOS epoch buffering, changelog compaction) and never changes emissions — every update is forwarded
+(KSC-88). `withCachingEnabled(EmissionSuppression…)` sets a store's cache caps (past them: an early commit);
+`withCachingDisabled()` is accepted and changes nothing (default caps). There is no global caching switch.
+Consolidate with `Suppressed.untilBarrier()` / `emit.mode: on-barrier`.
 Versioned `historyRetention` is retention **and** grace (older out-of-order records rejected).
+A versioned supplier in `Materialized.as(...)` makes any non-windowed key-value materialisation versioned
+(under the supplier's name): `table`/`toTable`, `KTable` `filter`/`mapValues`/`transformValues`, join results,
+non-windowed cogroup, `count`/`reduce`/`aggregate`. A rejected (too old) write forwards nothing; downstream
+aggregations ignore out-of-order history writes per source key (KS `isLatest`). Windowed/session aggregations
+refuse a versioned supplier at build time; `globalTable` accepts one (KS refuses — `KSC-125`). A versioned table
+accepts only `suppress(untilBarrier())` (or `emit.mode: on-barrier`): latest changes consolidated per commit, history
+writes pass through in order (the key's buffered latest first); other suppress kinds are refused (KIP-914). Under
+`exactly_once` every lane reads a RocksDB versioned store as of its own commit, so it may feed any join (FK included);
+an **in-memory** versioned table that a join reads from another lane is refused at build time (`KSC-126`, below).
+**No commit buffer — `lruMap` and the in-memory versioned store.** Both write directly instead of buffering each
+commit (an LRU store decides its own evictions, so a buffer above it is circular). Still exactly-once: an aborted
+commit always ends in an engine rebuild of the store from its changelog, so its writes never survive (with
+`withLoggingDisabled()` the rebuild is empty: every in-place ABORT restart, poison replays included, drops all its
+state). But neither can
+be read as of the last commit. **Exactly-once reads (`KSC-126`):** under `exactly_once` every lane reads every
+other built-in store (the default KV/window/session stores, the RocksDB versioned store) as of its own commit — joins,
+Processor API reads and punctuators never see another lane's uncommitted next-commit write; IQ and `at_least_once` read
+the latest state. So an `lruMap` / in-memory versioned table that a join reads from another lane is refused at build
+(`TopologyValidationException` naming the join and the store): either side of a PK or FK join, a stream-table join
+after a re-key, a stream-GlobalKTable join, a join reading another join's result table. A stream-table join with no
+re-key reads its own lane and is fine. Fix: a default store supplier or `persistentVersionedKeyValueStore`, or
+`at_least_once`. A Processor API node that *may* read one across lanes gets the `presumed-cross-lane-read` WARN instead
+(`references/processor-api.md`); an `lruMap` store's reads are always live (once KIP-892
+isolation-level reads land it will not honour `READ_COMMITTED`, `KSC-116`). LRU extras: a `get()` (an interactive query too) promotes the key and so changes the next eviction; a
+restart does not bring back the pre-restart key set — with more than `maxCacheSize` keys in the changelog, which survive
+depends on the parallel partition restore order and can differ between restarts, so a table backed by it can answer
+differently after a restart or HA failover. Evictions are local only by default; 🆕 `Stores.lruMap(name, maxCacheSize,
+tombstoneOnEviction = true)` also writes a changelog delete per eviction (needs logging). The `TopologyTestDriver` runs
+every versioned store on the
+in-memory backend, but the exactly-once checks judge the **declared** store: a RocksDB versioned join input passes, an
+in-memory versioned or `lruMap` one is refused — as in the engine.
+A `table()` store — or an `addReadOnlyStateStore` store, with or without an update processor — restored from its
+**source topic** takes each record's Kafka record timestamp (as in KS), not a custom extractor's — derived
+join/aggregation timestamps can differ after a restart until the key updates. Global stores restore from their
+changelog and keep the stored timestamps.
 
 **Versioned-store retention is a minimum bound, and its read contract matches Kafka Streams.** A
 point-in-time read below `observedStreamTime - historyRetention` (inclusive) is outside the window: it
@@ -195,13 +268,48 @@ by*. Two shapes break that:
 When advising on `withLocks`, say both halves: it serialises the keys within an epoch, and the
 rotation boundary is outside its reach. Do not claim locks make cross-key updates unconditionally safe.
 
+A third shape needs no store-key mismatch: **Processor API nodes in different sub-topologies connecting one store**
+(a re-key between them splits them). Their lanes cross barriers at different times, so one key's writes can land in
+the wrong commit order — under either guarantee. The build warns (`presumed-cross-sub-topology-write`, `warn`); see
+`references/processor-api.md`.
+
 ## Interactive queries
 
 `stoatflow.store(StoreQueryParameters.fromNameAndType(name, QueryableStoreTypes.keyValueStore()))`.
 `QueryableStoreTypes`: `keyValueStore()`, `windowStore()`, `sessionStore()`, `timestampedKeyValueStore()`,
-`timestampedWindowStore()`. `stoatflow.storeNames()` lists stores. Single-instance ⇒ **all state is global,
+`timestampedWindowStore()`, `versionedKeyValueStore()`, and the headers-aware
+`timestamped{KeyValue,Window}StoreWithHeaders()` / `sessionStoreWithHeaders()` /
+`versionedKeyValueStoreWithHeaders()`. **Pick the factory by the value shape you want back** (KS parity): every DSL
+materialisation — `table()`, `toTable()`, `globalTable()`, a `KTable` operator, a grouped or cogroup aggregation and
+every windowed aggregation — builds a timestamped store (the headers twin under `withRecordHeaders()` or
+`dsl.store-format: HEADERS`), and `keyValueStore()` / `windowStore()` over one — or its headers twin — answer with the plain
+value (`count()` reads back as `Long`); `timestampedKeyValueStore()` /
+`timestampedWindowStore()` give `ValueAndTimestamp` and also accept the headers twins; `sessionStore()` accepts a
+headers session store and answers with the plain aggregate. Do not unwrap `ValueAndTimestamp` after
+`keyValueStore()` — it never returns one. A Processor API read of one of these stores (`getStateStore`, e.g. a
+`globalTable` store) sees `ValueAndTimestamp<V>` values: type it as `TimestampedKeyValueStore<K, V>`. Each operator
+stores the timestamp it forwards (KS parity): the input's for a table/operator, `max(left, right)` for a table-table
+join, `max(input, old aggregate)` for a non-windowed aggregation. **Every IQ view is read-only** (KS parity): a same-shape view's `put`/`delete`/`remove`/
+`expireSessions` throw `UnsupportedOperationException`; a converting view (the pairs above) implements only the
+`ReadOnly*` interface, so there is nothing to call and a cast to a writable type throws `ClassCastException`. The UOE holds — including through `sessionStoreWithHeaders()` and
+`versionedKeyValueStoreWithHeaders()`, whose static type shows the write methods. Never write state through
+IQ; write from a processor connected to the store. IQ reads the **latest** state, uncommitted writes included — only
+processing lanes read as of their commit (under `exactly_once`). A handle re-resolves the store on every read, so it can be
+kept: across an in-place engine restart (`REPLACE_THREAD`, HA demote) a read throws the retriable
+`InvalidStateStoreException` until the app is `RUNNING` again (after an HA demote: until this pod is promoted back —
+query the new active); a held handle also serves while `PAUSED`. With
+stale reads, a `store()` call while stores restore throws `InvalidStateStoreException` — retry. A custom `QueryableStoreType` implements KS's
+`create(StateStoreProvider, String)` and should call `storeProvider.stores(name, this)` per read. `stoatflow.storeNames()` lists stores. Single-instance ⇒ **all state is global,
 no partition routing** (`StoreQueryParameters` has no `withPartition`); `enableStaleStores()` to read during
 restore. `store(...)` throws unless the app is `RUNNING` (or `RESTORING`/`VALIDATING_STATE` with stale reads).
+Key metadata: `queryMetadataForKey(store, key, keySerializer)` (+ a `(store, key, headers, keySerializer)`
+overload) and `queryMetadataForKey(store, key, [headers,] partitioner)` (KS 4.4, KIP-1321) return `KeyQueryMetadata`
+— the local host, no standbys, the key's partition in the changelog (or source) topic; `-1` for a store no topic
+backs (logging disabled, no source topic — the partitioner is not called). Informational only. Pass the headers when the serializer or
+partitioner reads them. With a partitioner, anything but a single in-range partition throws
+`IllegalArgumentException` — including `Optional.empty()` (KS returns an unusable metadata object instead). The
+partitioner is called with `value = null` (as KS does), so a Kotlin partitioner used here needs a nullable `V` (a
+non-null `V` fails with Kotlin's own `NullPointerException`).
 Note: `StoatFlowRuntime.fromConfig` (`:runtime`) exposes **no** public query accessor today — typed
 in-process IQ needs the `:core` `StoatFlow` engine handle directly.
 
@@ -232,6 +340,12 @@ restart. A deserialization `FAIL` keeps the graceful stop instead — the failed
 offset tracker, so the shutdown commits the pre-poison outputs and stops *before* the poison — and it
 writes no dead letter either. The processing handler renders its verdict **once** per failure (a FAIL
 is not re-offered at ancestor DAG levels). Error headers use the `__stoatflow.errors.*` namespace.
+
+**With a timestamp assigner (`withTimestampAssigner` / a `TimestampExtractor`), a deserialization skip goes
+first.** It has no event time, so it is dispatched ahead of every other partition's records; a partition
+receiving undeserializable records faster than they are skipped (a backlog during catch-up) holds the
+others back until it drains. Kafka Streams slows the others instead. Treat a sustained DLQ flood as an
+upstream fault.
 
 **A size-rejected dead letter carries no value.** When the broker refuses an output record with
 `RecordTooLargeException`, the dead letter is emitted with `value = null` plus

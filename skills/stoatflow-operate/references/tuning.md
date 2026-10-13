@@ -32,7 +32,8 @@ Epoch size (`commit-barrier.max-epoch-records`, default no cap) normally stays u
 
 - `stoatflow.state.uncommitted-max-bytes` — default 256 MiB. A backstop: exceeding it fires an early
   `MEMORY_PRESSURE` commit barrier. **Lower it if you see OOMKills.** Rough container budget: 4 GiB → ~1 GiB,
-  8 GiB → 1–2 GiB, 16 GiB → 2–4 GiB.
+  8 GiB → 1–2 GiB, 16 GiB → 2–4 GiB. With the default persistent timer backend, timer writes count toward it too,
+  so a topology that registers many timers per record can fire these barriers even with no other state store.
 - `stoatflow.caching.{max-estimated-bytes (256 MiB), max-entries (unbounded)}` — per-store cache caps →
   `CACHE_PRESSURE` early commit.
 - `stoatflow.rocks-db.preset` — `LOW_MEMORY` (64 MiB) | `DEFAULT` (256 MiB) | `HIGH_PERFORMANCE` (1 GiB),

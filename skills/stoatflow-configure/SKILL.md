@@ -53,8 +53,9 @@ runtime:
   bounded by default, the deliberate difference from KS's unbounded RocksDB), `rocks-db.preset`
   (`LOW_MEMORY` 64 MiB / `DEFAULT` 256 MiB / `HIGH_PERFORMANCE` 1 GiB), `rocks-db.backend` (`AUTO`/`FFM`/`JNI`),
   `rocks-db.metrics`, `state.format-downgrade` (`refuse` default | `wipe-and-restore` — see below).
-- **`stoatflow.dsl`** — `store-format` (`DEFAULT` | `HEADERS`): the global default for whether DSL
-  aggregations persist the processing record's `Headers` (KIP-1271/1285). Per-store
+- **`stoatflow.dsl`** — `store-format` (`DEFAULT` | `HEADERS`): the global default for whether DSL-materialized
+  stores (tables, `KTable` operators, table-table and FK join results, aggregations) persist the processing record's `Headers`
+  (KIP-1271/1285). Per-store
   `Materialized.withRecordHeaders()` / `withoutRecordHeaders()` always wins. Turning headers **on** is a
   free lazy in-place upgrade; turning them **off** over a store that already carries them is a *declared
   format change* — startup refuses with an actionable message unless you set
@@ -64,7 +65,11 @@ runtime:
   persisted headers, and re-enabling headers does **not** bring them back.
 - **`stoatflow.changelog`** — `enabled`, `replication-factor` (-1 = broker default), `num-partitions` (3;
   per-store override via `Materialized.withChangelogNumPartitions(n)` and its siblings — prefer small
-  counts, and note the count is create-time immutable), `timer-num-partitions` (-1 = inherit).
+  counts, and note the count is create-time immutable), `timer-num-partitions` (-1 = inherit). With
+  `create-topics-if-not-exist: false`, pre-create the engine's own changelogs too — `describe()` does not list
+  them: `<app>-stoatflow-watermark-changelog` (1 partition; any windowed aggregation, time-based `suppress` or
+  stream-stream join), `<app>-<store>-emitfrontier-changelog` per `onWindowClose()` aggregation,
+  `<app>-timer-store-changelog` for Processor API timers.
 - **`stoatflow.watermark`** — `max-out-of-orderness-ms` (10000), `idleness-timeout-ms`, `auto-interval-ms`.
   `idleness-timeout-ms` is the **default** for sources that set no `WatermarkStrategy.withIdleness(...)` of
   their own; a per-source timeout wins for that source's partitions. `0` disables idleness only for the

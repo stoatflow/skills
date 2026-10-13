@@ -4,7 +4,7 @@ applyTo: "**/*.{kt,java}"
 
 # StoatFlow — rules for AI coding assistants
 
-> **Targets StoatFlow 1.0.0-rc.3 (Kafka Streams 4.3 API surface).** Pre-GA — pin the matching
+> **Targets StoatFlow 1.0.0-rc.4 (Kafka Streams 4.3 API surface).** Pre-GA — pin the matching
 > release of this file if your StoatFlow version differs.
 
 StoatFlow is a JVM stream-processing library that is **source-compatible with Kafka Streams 4.3 via an
@@ -58,7 +58,8 @@ Mis-routed by the blind swap (fix by hand / the OpenRewrite recipe fixes them): 
    separate key/value); production serialization errors fold into `handle(...)` (branch on
    `(context as ProductionContext).failedOn`). *(KSC-01)*
 7. **`StreamPartitioner`** lives in `io.stoatflow.core.topology`; multicast on `repartition()` **throws**
-   (single-instance) — multicast only on sinks. *(KSC-34)*
+   (single-instance) — multicast only on sinks. KS 4.4 shape: override the 5-arg `partitions(..., headers, n)` in a
+   class to route by headers; keys are serialized with the record's headers, as KS does at sinks (KIP-1321). *(KSC-34, KSC-103)*
 8. **`Suppressed.maxBytes` throws** (in-memory buffer) — use `maxRecords` / `unbounded`. *(KSC-35)*
 9. **`TopologyTestDriver` enforces serdes** at the source/sink boundary and **commits per `pipeInput`**
    (caching aggregations emit every intermediate) — configure serdes; expect per-pipe emissions.
@@ -95,9 +96,9 @@ dependencyResolutionManagement {
 }
 // build.gradle.kts
 dependencies {
-  implementation("io.stoatflow:stoatflow-runtime:1.0.0-rc.3")   // batteries-included (pulls -core)
-  // implementation("io.stoatflow:stoatflow-core:1.0.0-rc.3")   // DSL/engine only
-  // testImplementation("io.stoatflow:stoatflow-test-utils:1.0.0-rc.3")
+  implementation("io.stoatflow:stoatflow-runtime:1.0.0-rc.4")   // batteries-included (pulls -core)
+  // implementation("io.stoatflow:stoatflow-core:1.0.0-rc.4")   // DSL/engine only
+  // testImplementation("io.stoatflow:stoatflow-test-utils:1.0.0-rc.4")
 }
 ```
 
