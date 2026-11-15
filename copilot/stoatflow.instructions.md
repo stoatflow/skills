@@ -4,10 +4,10 @@ applyTo: "**/*.{kt,java}"
 
 # StoatFlow — rules for AI coding assistants
 
-> **Targets StoatFlow 1.0.0-rc.4 (Kafka Streams 4.3 API surface).** Pre-GA — pin the matching
+> **Targets StoatFlow 1.0.0-rc.5 (Kafka Streams 4.4 API surface).** Pre-GA — pin the matching
 > release of this file if your StoatFlow version differs.
 
-StoatFlow is a JVM stream-processing library that is **source-compatible with Kafka Streams 4.3 via an
+StoatFlow is a JVM stream-processing library that is **source-compatible with Kafka Streams 4.4 via an
 import swap** — but it is **not** Kafka Streams. Your Kafka-Streams training is *confidently wrong* on the
 points below. These rules override it. (This file is the cross-tool distillate of the StoatFlow skills
 pack; the full skills carry depth.)
@@ -60,23 +60,31 @@ Mis-routed by the blind swap (fix by hand / the OpenRewrite recipe fixes them): 
 7. **`StreamPartitioner`** lives in `io.stoatflow.core.topology`; multicast on `repartition()` **throws**
    (single-instance) — multicast only on sinks. KS 4.4 shape: override the 5-arg `partitions(..., headers, n)` in a
    class to route by headers; keys are serialized with the record's headers, as KS does at sinks (KIP-1321). *(KSC-34, KSC-103)*
-8. **`Suppressed.maxBytes` throws** (in-memory buffer) — use `maxRecords` / `unbounded`. *(KSC-35)*
+8. **`suppress(untilTimeLimit)` releases on the watermark**, not the task's stream time — every update is buffered,
+   a key leaves `limit` after its first one; `Duration.ZERO` emits on the next watermark advance. *(KSC-119)*
 9. **`TopologyTestDriver` enforces serdes** at the source/sink boundary and **commits per `pipeInput`**
    (caching aggregations emit every intermediate) — configure serdes; expect per-pipe emissions.
    *(KSC-62/63/71)*
-10. **`Stores.*` require-guard:** `Materialized.as` / `StreamJoined` accept only `Stores.*` suppliers
-    (hand-rolled `*BytesStoreSupplier` throws). And `VersionedRecord.validTo()` returns `Optional<Long>`.
-    *(KSC-21, KSC-04)*
+10. **`Stores.*` require-guard:** `Materialized.as` / `StreamJoined` accept only `Stores.*` suppliers — every
+    one, timestamped and headers-aware included (hand-rolled `*BytesStoreSupplier` throws); a supplier of another store
+    kind than the operator's is refused at topology build, and a windowed aggregation refuses `retainDuplicates = true`.
+    And `VersionedRecord.validTo()` returns `Optional<Long>`. *(KSC-21, KSC-152, KSC-04)*
+11. **Output topics must exist at start:** a missing sink or dead-letter topic refuses `start()`
+    (`MissingOutputTopicException`, naming it) — KS lets the first send create it. Create them, or set
+    `validation.validate-output-topics=false` for a cluster that relies on auto-creation. A handler wrapping a built-in
+    DLQ handler returns its delegate's `deadLetterTopics()`. *(KSC-148)*
 
 ## Config quick rules
 
 - Config is `application.yaml` (`stoatflow.*` + `runtime.*`) or the typed `StreamsConfig.Builder`; a KS
   `Properties`/`Map` maps in via `StreamsConfig.fromProperties(props).build()` / `fromMap(map).build()`
-  (74-key KS overlap).
+  (79-key KS overlap).
 - **Do not invent config keys** — validate against the schema:
   `https://stoatflow.io/schemas/stoatflow-config-schema.json`.
 - Processing guarantee: `stoatflow.processing-guarantee: exactly_once | at_least_once` (default
-  `exactly_once`). Lanes: `withNumberOfLanes(n)` (recommended ≈ CPU × 4).
+  `exactly_once`). Lanes: `stoatflow.lanes.count` (default `max(2, CPU cores / 4)` per sub-topology, on
+  `PLATFORM` threads), or `withNumberOfLanes(n)` for one sub-topology; many lanes plus `lanes.thread-type: VIRTUAL`
+  for blocking I/O. Output is zstd-compressed by default.
 
 ## Dependencies & repository (private)
 
@@ -96,15 +104,15 @@ dependencyResolutionManagement {
 }
 // build.gradle.kts
 dependencies {
-  implementation("io.stoatflow:stoatflow-runtime:1.0.0-rc.4")   // batteries-included (pulls -core)
-  // implementation("io.stoatflow:stoatflow-core:1.0.0-rc.4")   // DSL/engine only
-  // testImplementation("io.stoatflow:stoatflow-test-utils:1.0.0-rc.4")
+  implementation("io.stoatflow:stoatflow-runtime:1.0.0-rc.5")   // batteries-included (pulls -core)
+  // implementation("io.stoatflow:stoatflow-core:1.0.0-rc.5")   // DSL/engine only
+  // testImplementation("io.stoatflow:stoatflow-test-utils:1.0.0-rc.5")
 }
 ```
 
 Runtime needs a license: set `STOATFLOW_LICENSE_KEY` (value starts `key/…`, from your onboarding email).
-Requires **JDK 25** with `--enable-preview --enable-native-access=ALL-UNNAMED` (the `io.stoatflow` Gradle
-plugin / Maven parent add these). Never inline a realistic token — credentials come from the customer portal.
+Requires **JDK 25 or newer** (CI tests JDK 25 and the newest JDK release, 27 today) with
+`--enable-native-access=ALL-UNNAMED` (the `io.stoatflow` Gradle plugin / Maven parent add it). Never inline a realistic token — credentials come from the customer portal.
 
 ## Links
 

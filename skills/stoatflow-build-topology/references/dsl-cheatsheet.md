@@ -8,7 +8,7 @@ are Kafka `org.apache.kafka.common.serialization.Serde`/`Serdes`. Every operator
 
 - `builder.stream<K,V>(topic | Collection<String> | Pattern, Consumed?)` → `KStream`. A `Pattern` source: whole-name `matches()`; new matching topics picked up within `metadata.max.age.ms` (30 s default for pattern topologies) as an incremental assignment; several patterns are fine but a topic matched by two is rejected at assignment; a literal topic a pattern also matches is rejected at build; matching nothing = WARN + wait; **no own-topic filtering** — keep `<appId>-*-changelog`, the HA coordination topic and DLQ topics out of the pattern (ADR-143). **A matched topic being DELETED is survived** — the engine restarts in place (~0.5-1 s, no pod restart) and converges on the remaining topics; a deleted *literal* source topic is still fatal, matching KS
 - `builder.table(topic, Consumed?, Materialized?)` → `KTable` (always materialized; store `{topic}-store`)
-- `builder.globalTable(...)` → `GlobalKTable` (single-instance: functionally identical to `table`; KS compat)
+- `builder.globalTable(...)` → `GlobalKTable` (single-instance: functionally identical to `table`; KS compat; always reads from the earliest offset, whatever `Consumed` or `auto.offset.reset` say, as KS's GlobalKTable does; when its committed offset left the topic it re-reads the topic over its kept store, where KS's global thread wipes and reloads — KSC-156)
 - `stream.to(topic, Produced?)` / `stream.to(TopicNameExtractor, Produced?)` (per-record routing) · `forEach` · `print`
 
 ## Stateless KStream transforms
@@ -47,8 +47,8 @@ Java SAM types: `ValueMapper`, `ValueMapperWithKey`, `KeyValueMapper`, `Predicat
 
 - `KStream.groupByKey(Grouped?)` → `KGroupedStream` (no re-key)
 - `KStream.groupBy(selector, Grouped?)` → `KGroupedStream` (key-changing; selector `(K,V)->KR`)
-- `KTable.groupBy(selector)` → `KGroupedTable` (selector `(K,V)->KeyValue<KR,VR>`; **source table must be
-  materialized** or build fails)
+- `KTable.groupBy(selector)` → `KGroupedTable` (selector `(K,V)->KeyValue<KR,VR>`; any readable table — materialized,
+  derived `filter`/`mapValues`/`transformValues`, suppressed, windowed; only an unmaterialized join result fails the build)
 
 **`KGroupedStream` folds → all return `KTable`:**
 - `count()` (+ `(Named)`, `(Materialized)`, `(Named, Materialized)`) → `KTable<K, Long>`
@@ -79,7 +79,7 @@ val counts: KTable<String, Long> =
 
 ## Config objects
 
-- `Consumed.with(keySerde, valueSerde)` · `.withKeySerde`/`.withValueSerde`/`.withName`/`.withWatermarkStrategy`/`.withOffsetResetPolicy`/`.withMaterializeFromSourceTopic(bool?)` (tables)
+- `Consumed.with(keySerde, valueSerde)` · `.withKeySerde`/`.withValueSerde`/`.withName`/`.withWatermarkStrategy`/`.withTimestampExtractor` (KS's built-in extractors are in `io.stoatflow.core.processor`)/`.withOffsetResetPolicy` (a partition with no committed offset, or one the topic no longer holds — KS's rule; else `auto.offset.reset`; `none` stops the app naming the partition)/`.withMaterializeFromSourceTopic(bool?)` (tables)
 - `Produced.with(keySerde, valueSerde)` · `.withKeySerde`/`.withValueSerde`/`.withStreamPartitioner`/`.withName`
 - `Grouped.with([name,] keySerde, valueSerde)` · `Grouped.as(name)`
 - `Repartitioned.with(keySerde, valueSerde)` (for `repartition()`; multicast partitioner **throws** here)

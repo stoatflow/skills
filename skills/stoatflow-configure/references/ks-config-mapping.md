@@ -12,8 +12,8 @@ StoatFlow keeps a **typed** config model (`StreamsConfig` data class + `Builder`
   `[ipv6]:port` or blank) and a malformed value throws `IllegalArgumentException` — Kafka Streams 4.4 does
   the same (with `ConfigException`). `StreamsConfig.toProperties()` emits the resolved, masked config back as KS-keyed
   `Properties` (for `/config` / diffing).
-- **Coverage — the ~74-key KS-4.3.0 overlap:** typed mappings, class-name pluggables (serdes, the three
-  exception handlers, `default.client.supplier`, `rocksdb.config.setter`), and client prefixes
+- **Coverage — the 79-key KS-4.4.0 overlap:** typed mappings, class-name pluggables (serdes, the three
+  exception handlers, `default.timestamp.extractor`, `default.client.supplier`, `rocksdb.config.setter`), and client prefixes
   (`consumer.` / `main.consumer.` / `restore.consumer.` / `producer.` / `admin.`). The KS `*_CONFIG` symbol
   constants + prefix helpers (`consumerPrefix(...)` … `adminClientPrefix(...)`) are shipped for symbol-level
   source compatibility (KSC-80).
@@ -41,6 +41,18 @@ StoatFlow keeps a **typed** config model (`StreamsConfig` data class + `Builder`
 - **`topology.description.push.enabled`** (KS 4.4, KIP-1331) is a recognised no-op: the push needs the streams
   group protocol and StoatFlow is a classic consumer group. It WARNs once and is dropped (never forwarded, never
   throws under strict). The same topology description is a pull from `GET /topology/ks` (KSC-113).
+- **The three KIP-892 keys** (KS 4.4): `statestore.uncommitted.max.bytes` maps to `stateStoreUncommittedMaxBytes`
+  (YAML `stoatflow.state.uncommitted-max-bytes`), honoured as given — the default stays 256 MiB (KS: 64 MiB), the
+  budget is application-wide, under exactly-once it also counts the output held back during a commit, and `-1` (KS
+  "disable") is refused because the budget also caps the epoch size (KSC-105).
+  `default.interactive.query.isolation.level` maps to `interactiveQueryIsolationLevel` (YAML
+  `stoatflow.state.interactive-query-isolation-level`; `READ_UNCOMMITTED` default or `READ_COMMITTED`, case-insensitive;
+  anything else throws) — `store()` applies it to every store, global stores included (KSC-144).
+  `enable.transactional.statestores` is a recognised no-op: `true` is silent, `false` WARNs that it cannot be honoured
+  — StoatFlow's DSL-selectable stores are always transactional (KSC-104). Constants on `StreamsConfig`:
+  `TRANSACTIONAL_STATE_STORES_CONFIG`, `STATESTORE_UNCOMMITTED_MAX_BYTES_CONFIG`,
+  `DEFAULT_INTERACTIVE_QUERY_ISOLATION_LEVEL_CONFIG`.
+  `metadata.cluster.check.enable` (KS 4.4) is a client key and routes to all three clients like any bare key.
 
 - **`processor.wrapper.class` (KIP-1112)** is supported (ADR-118 Batch-14): the named
   `io.stoatflow.core.processor.ProcessorWrapper` is instantiated at ingestion and handed the raw config map
@@ -52,6 +64,18 @@ StoatFlow keeps a **typed** config model (`StreamsConfig` data class + `Builder`
   `Builder.processorWrapper(wrapper)` or `Builder.processorWrapperClassName(className)` (the latter calls
   `configure(emptyMap())`; it is a separately named method so the Java call `processorWrapper(null)` stays
   unambiguous). Caveats live in the `stoatflow-build-topology` processor-API reference.
+- **`default.timestamp.extractor`** is supported: a global fallback `TimestampExtractor` for sources whose
+  `Consumed` carries no watermark strategy (a `Class` or a class name; KS's built-ins are
+  `io.stoatflow.core.processor.{FailOnInvalidTimestamp, LogAndSkipOnInvalidTimestamp,
+  UsePartitionTimeOnInvalidTimestamp, WallclockTimestampExtractor}`, and their KS names
+  `org.apache.kafka.streams.processor.*` — string or `Class` — load those). **Unset by default** — the Kafka record
+  timestamp is used and a negative one is a valid event time, where KS defaults to `FailOnInvalidTimestamp` and
+  refuses it (KSC-138). Set it to `FailOnInvalidTimestamp` or `LogAndSkipOnInvalidTimestamp` to keep KS's refusal.
+  Typed equivalent: `Builder.defaultTimestampExtractor(extractor | className)`; no YAML key.
+- **`num.stream.threads`** maps to the lane count (`numLanes`; default `max(2, CPU cores / 4)` per sub-topology).
+  The lanes run on `PLATFORM` threads by default; the StoatFlow-only key **`lanes.thread-type`** (`PLATFORM` |
+  `VIRTUAL`, case-insensitive; YAML `stoatflow.lanes.thread-type`, `Builder.laneThreadType(...)`) selects
+  `VIRTUAL` for many lanes doing blocking I/O. Kafka Streams has no such key — its stream threads are OS threads.
 
 So a ported KS `Properties` usually needs **no change**; for StoatFlow-only engine knobs use the typed
 `Builder` or `application.yaml`.
@@ -68,7 +92,8 @@ The **producer** is a 5-layer variant: 1. Kafka client defaults → 2. StoatFlow
 3. the consumer's `security.*` / `ssl.*` / `sasl.*` subset → 4. **your** `stoatflow.kafka.producer` →
 5. forced overrides. Layer 4 overrides Layer 3 **per key**, so a producer block that shadows a security
 family only partially inherits the rest and can fail producer construction — shadow a family completely or
-not at all (StoatFlow warns when it sees a partial shadow).
+not at all. The admin and restoration-consumer blocks inherit the same way; StoatFlow warns when it sees a
+partial shadow in any of the three.
 
 The **main consumer** is likewise 5 layers: the `main.consumer.` overrides sit between
 `stoatflow.kafka.consumer` and the forced layer, and are scoped to that client alone.
@@ -102,33 +127,46 @@ stoatflow:
 **StoatFlow framework defaults (overridable — Layer 2):**
 
 - Consumer: `max.poll.records` 500, `fetch.max.bytes` 50 MiB, `max.partition.fetch.bytes` 10 MiB (Kafka 1
-  MiB), `auto.offset.reset` `earliest` (matches KS), `max.poll.interval.ms` 10 min (Kafka 5 min),
+  MiB), `auto.offset.reset` `earliest` (matches KS; while a source has its own `Consumed` reset policy — a
+  `globalTable` always — the consumer runs `none` and StoatFlow resets a partition it cannot position, no committed
+  offset or one out of range, by the source's policy, else this value, as KS's `StreamThread` does; a log truncated by
+  an unclean leader election resumes at the divergence point, never reset),
+  `max.poll.interval.ms` 10 min (Kafka 5 min),
   `partition.assignment.strategy` `CooperativeStickyAssignor` (Kafka's default list runs eager Range; under it
   a topic newly matching a pattern source or a partition-count increase terminated the single instance —
   ADR-143; overriding to an eager assignor logs a startup WARN). Conditional: a topology with a pattern
   source — `stream(Pattern)` or Processor-API `addSource(…, Pattern)` — sets `metadata.max.age.ms` 30 s (Kafka
   5 min) unless you set it; `/config` shows the effective value.
 - Producer: `batch.size` 256 KiB, `linger.ms` 20, `retry.backoff.ms` 50, `buffer.memory` 256 MiB,
-  `enable.idempotence` true, `acks` all, `max.in.flight.requests.per.connection` 5.
+  `enable.idempotence` true, `acks` all, `max.in.flight.requests.per.connection` 5, `compression.type` zstd
+  (KS sets no codec; outputs, changelogs and dead letters all go through this producer).
 
 **Forced overrides (the last layer — you cannot change these):**
 
 - Consumer: `bootstrap.servers`, `group.id` = applicationId, `group.instance.id` = applicationId (KIP-345;
-  **omitted under HA** `assign()`), `enable.auto.commit=false`, `allow.auto.create.topics=false`; **EOS only:** `isolation.level=read_committed`
+  **omitted under HA** `assign()`), `enable.auto.commit=false`, `allow.auto.create.topics=false`, `bootstrap.resolve.timeout.ms=0`; **EOS only:** `isolation.level=read_committed`
   (KSC-93 — an EOS app must not ingest a transactional upstream's aborted batches; under ALO the key is
   user-settable).
 - Producer (always): `bootstrap.servers`, `retries=Integer.MAX_VALUE`, `max.block.ms` = barrier timeout,
-  `delivery.timeout.ms` = barrier timeout.
+  `delivery.timeout.ms` = barrier timeout, `bootstrap.resolve.timeout.ms=0`.
+- Admin client: `bootstrap.resolve.timeout.ms=0`. On every client this pins synchronous bootstrap DNS
+  resolution (Kafka Streams 4.4 forces the same, KAFKA-20939): an asynchronously resolving client whose
+  resolution fails stays broken until rebuilt.
 - Producer (**EOS only**): `transactional.id` = `{applicationId}-producer`, `transaction.timeout.ms` =
   barrier timeout, `enable.idempotence` true, `acks` all, `max.in.flight.requests.per.connection` 5. (Under
   ALO these last three revert to the overridable framework defaults.)
 - Restoration consumer: `group.id` = `{applicationId}-restoration-{timestamp}`, `enable.auto.commit=false`, `allow.auto.create.topics=false`,
-  `auto.offset.reset=earliest`, `isolation.level` = `read_committed` (EOS) / `read_uncommitted` (ALO).
+  `bootstrap.resolve.timeout.ms=0`, `auto.offset.reset=none` (as Kafka Streams' restore consumer), `isolation.level` =
+  `read_committed` under EOS only (under ALO the `consumer.` / `restore.consumer.` value, default `read_uncommitted`;
+  a `main.consumer.` key does not reach it — Kafka Streams parity).
 
 **Security: set it once, on the consumer.** `security.*` / `ssl.*` / `sasl.*` under
 `stoatflow.kafka.consumer` propagate to **every** other client StoatFlow builds — the producer (KSC-92),
-the internal admin clients, the restoration consumers and the HA metadata-log clients. Only repeat them on
-another client's own map when that client authenticates as a different principal; that map always wins.
+the internal admin clients, the restoration consumers and the HA coordination-topic clients. Only repeat them
+on another client's own map when that client authenticates as a different principal; that map always wins. The
+HA coordination-topic clients follow the same maps (producer → `producer`, admin → `admin`, consumer →
+`restoration-consumer`, as it reads the topic like a restoration consumer), each with its counterpart's
+`client.dns.lookup` too.
 
 A ported KS `Properties` that spells security **unprefixed** works too — see the bare-key routing bullet
 above. YAML has no unprefixed form (the nesting *is* the prefix), which is exactly why the producer

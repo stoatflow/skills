@@ -10,8 +10,7 @@ Read `references/stoatflow-primer.md` first — the identity rules there (never 
 `org.apache.kafka.streams.*`, never depend on `kafka-streams`, EXACTLY_ONCE default, single-instance
 scaling) are exactly what a Kafka-Streams-trained assistant gets wrong on a port.
 
-StoatFlow reimplements the **Kafka Streams 4.3** DSL/API surface (with a few Kafka Streams 4.4 additions already in —
-e.g. `CloseOptions.GroupMembershipOperation.DEFAULT`, KSC-112) under `io.stoatflow.core.*` and depends
+StoatFlow reimplements the **Kafka Streams 4.4** DSL/API surface under `io.stoatflow.core.*` and depends
 on **`kafka-clients` only**. A port is therefore mostly a **mechanical import rewrite** plus a short,
 enumerated list of intentional divergences (the register). Binary compatibility (dropping in the real
 `kafka-streams` jar) is **not** pursued and never will be.
@@ -33,7 +32,8 @@ A port has **two halves**:
    - **Run it against a project that still compiles against Kafka Streams** — the rules match resolved
      types; a source that does not type-check is silently skipped (the recipe's `FlagUnparsedSources`
      reports any such file, so this fails loudly).
-   - **Use JDK 17, 21, or 25** to run the recipe. The *ported app* then requires **JDK 25**.
+   - **Use JDK 17 to 25** to run the recipe — OpenRewrite has no parser for JDK 26 or 27 (it fails with
+     `Unable to construct Java25Parser`). The *ported app* then requires **JDK 25 or newer**.
    - Configure the StoatFlow Maven repo + credentials first (see `stoatflow-project-setup`); for Maven,
      make it visible to `<pluginRepositories>` too.
    ```bash
@@ -96,6 +96,12 @@ typical port always hits:
 - **`processing.guarantee` default (KSC-84):** absent ⇒ StoatFlow runs **EXACTLY_ONCE** (KS: `at_least_once`).
   A ported app that relied on the KS default **silently changes semantics**. Set `at_least_once`
   explicitly if that's what you want.
+- **Output codec and lane count (defaults, not divergences):** StoatFlow's producer compresses with **zstd** by
+  default (KS sets no codec), so a ported app's output, changelogs and dead letters change codec — every Kafka
+  consumer since 2.1 reads it; `stoatflow.kafka.producer.compression.type` restores the old one. Parallelism
+  starts at `max(2, CPU cores / 4)` `PLATFORM` lanes per sub-topology (KS: one stream thread); `num.stream.threads`
+  maps to `lanes.count`. Blocking I/O in processors: raise `lanes.count` with `lanes.thread-type: VIRTUAL`
+  (a KS-keyed `Properties` takes `lanes.thread-type=VIRTUAL` too).
 - **`StreamPartitioner` (KSC-34):** lives in `io.stoatflow.core.topology`, not `processor`. Multicast on
   `repartition()` throws (single-instance) — multicast only on sinks. KS 4.4 shape (KIP-1321): a class overriding
   the 5-arg `partitions(..., headers, numPartitions)` is called with the record's headers; 4-arg lambdas compile.
@@ -106,7 +112,19 @@ typical port always hits:
 - **Exception handlers (KSC-01):** `ProcessingExceptionHandler` takes a `processor.Record<*,*>`, not
   separate key/value; production serialization errors fold into `handle(...)` (branch on
   `(context as ProductionContext).failedOn`).
-- **`Suppressed.maxBytes` (KSC-35):** throws (in-memory object storage) — use `maxRecords`/`unbounded`.
+- **`suppress(untilTimeLimit)` (KSC-119):** KS semantics (every update buffered, released once the clock reaches the
+  first update's timestamp + `limit`) but on the **watermark**, not the task's stream time — `Duration.ZERO` emits on
+  the next watermark advance.
+- **Negative timestamps (KSC-138):** KS's default `FailOnInvalidTimestamp` stops the app on a negative record
+  timestamp; StoatFlow sets no default extractor and treats every time but `Long.MIN_VALUE` as valid (a raw `-1`, no
+  timestamp, is skipped and counted). To keep KS's refusal, set `default.timestamp.extractor` to
+  `FailOnInvalidTimestamp` or `LogAndSkipOnInvalidTimestamp` — KS's built-in extractors ship in
+  `io.stoatflow.core.processor`. Windows near 0 differ: a test with timestamps below a window size sees windows that
+  start before 0.
+
+- **Output topics (KSC-148):** KS lets the first send create a sink or DLQ topic (broker auto-creation); StoatFlow
+  refuses to start while one is missing (`MissingOutputTopicException`, naming it). Create them before the cutover,
+  or set `validation.validate-output-topics=false` for a cluster that relies on auto-creation.
 
 The **complete, register-ID-tagged** table (every `KSC-NN` / `D-N`, with the exact fix) is in
 **`references/divergences.md`**. Work it against your build errors.

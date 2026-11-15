@@ -2,12 +2,12 @@
 
 Teach your AI coding assistant to write **correct StoatFlow code**.
 
-StoatFlow is source-compatible with Kafka Streams 4.3 via an import swap — which means every assistant's
+StoatFlow is source-compatible with Kafka Streams 4.4 via an import swap — which means every assistant's
 Kafka-Streams training makes it *confidently wrong* on exactly the points where StoatFlow diverges: the
 import root, the `EXACTLY_ONCE` default, single-instance scaling (lanes, not replicas), the private Maven
 repository, watermark semantics, and more. This pack puts the right answers in front of the assistant.
 
-> **Targets StoatFlow 1.0.0-rc.4** (Kafka Streams 4.3 API surface). Pre-GA — the API may still
+> **Targets StoatFlow 1.0.0-rc.5** (Kafka Streams 4.4 API surface). Pre-GA — the API may still
 > change. If your StoatFlow version differs, use the matching tagged release of this pack (`git tag` /
 > release list).
 

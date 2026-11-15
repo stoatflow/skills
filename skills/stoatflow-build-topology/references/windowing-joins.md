@@ -17,6 +17,17 @@ On `KGroupedStream`: `.windowedBy(TimeWindows|SlidingWindows)` → `TimeWindowed
 `Windowed<K>`: `windowStart()`/`windowEnd()` (millis), `windowStartTime()`/`windowEndTime()` (`Instant`),
 `key`/`window` (Kotlin) / `getKey()`/`getWindow()` (Java). Half-open `[start, end)`.
 
+**Any event time but `Long.MIN_VALUE`, negative included — windows near 0 differ from Kafka Streams.** Windows are
+floor-aligned for every time, with no clamp at 0: a record joins every window that contains it, including windows that
+start before 0. Tumbling and hopping windows differ from KS for a time below `size − advance`: a record at 5 s in 60 s
+windows advancing by 10 s joins six windows (starting −50 s … 0), where KS gives one, `[0, 60 s)`. A sliding record at
+`0 ≤ t < D` gets its own left window `[t − D, t]`, where KS combines those records into one `[0, D]` window. Results
+above those times are identical. Joins probe across 0 and emit LEFT/OUTER null sides in time order across 0;
+`OnWindowClose` emits windows and sessions that end below 0. A Kafka Streams consumer of the windowed output fails on a
+negative window start (its `TimeWindowedDeserializer` builds a `Window`, which rejects one). At the other end, no window
+ends past `Long.MAX_VALUE`: a record within one window size of it (a sliding record at exactly `MAX`) joins no window and
+is dropped as late, `stoatflow.dropped.records.total{reason=late_window}` (KS fails on it — its window end wraps).
+
 Session `aggregate(...)` **requires an explicit session merger** `(key, agg1, agg2) -> merged` as a third
 function; `count()`/`reduce()` supply it implicitly.
 
@@ -49,10 +60,28 @@ source uses `WatermarkStrategy.noWatermarks()` (it pins the watermark for the wh
 
 **Suppression:** `KTable.suppress(Suppressed.untilWindowCloses(bufferConfig))` (windowed) /
 `Suppressed.untilTimeLimit(duration, bufferConfig)`. `Suppressed.BufferConfig`: `unbounded()`,
-`maxRecords(n)`, `.emitEarlyWhenFull()`, `.shutDownWhenFull()`, `.withLoggingDisabled()`,
-`.withChangelogNumPartitions(n)` (StoatFlow extension). **`maxBytes(...)`
-throws `UnsupportedOperationException`** (StoatFlow buffers in-memory objects, not bytes) — use
-`maxRecords`. The buffer's changelog **follows the global `changelog.num-partitions` by default**, like
+`maxRecords(n)`, `maxBytes(n)` / `.withMaxBytes(n)` (serialized size, headers included — KS estimates memory),
+`.emitEarlyWhenFull()`, `.shutDownWhenFull()`, `.withLoggingDisabled()`, `.withChangelogNumPartitions(n)` (StoatFlow
+extension). The bound covers the whole application, not one task (KSC-154: size a KS bound × the input partitions, at
+least one record per writer). Each `suppress()` has its own buffer; an eager one gives each writer an even share of the
+bound (bound ÷ the writer count, rounded down — a record larger than a writer's byte share leaves at once). The writers
+are the lanes of its sub-topology and, when an upstream operator emits on watermark/punctuator time (a LEFT/OUTER
+stream-stream join's unmatched side, an `OnWindowClose` aggregation, a Processor API punctuator), its punctuation lane.
+A writer over its share emits its own oldest keys (earliest buffer time, then key bytes) — never another lane's key, though
+the punctuation lane also emits restored keys and any beyond a writer's share while the buffer is over its bound; with
+skewed keys a busy lane emits early at its share while other shares sit unused; a key's values leave in buffered order and every writer keeps suppressing (with a `processor.wrapper.class` set, a suppress
+behind an `OnWindowClose` aggregation counts its lanes as writers too: its punctuation lane gets bound ÷ (lanes + 1)); after a restart the next watermark
+advance emits the oldest restored keys early while the buffer is over its bound. Over a bound after a put
+(`records > maxRecords || bytes > maxBytes`, KS's check) a strict one throws `BufferFullException` to the processing
+exception handler (the default shuts down). Every emission carries the latest buffered update's **headers, timestamp and source coordinates** (`topic()` / `partition()` / `offset()` downstream, as in KS) and is never `isLate()`;
+records released together leave in (buffer time, key) order; `untilWindowCloses` drops a `null` final result (KS).
+**`untilTimeLimit` (KS semantics):** every update is buffered — the first too — and a key leaves `duration` after its
+**first** buffered update with its latest value, once the watermark reaches that update's timestamp + `duration`; it is
+measured on the **watermark**, not KS's task stream time (KSC-119: `Duration.ZERO` emits on the next watermark
+advance). A join or `groupBy` reads an `untilWindowCloses` / `untilTimeLimit` table through its value getter — a
+buffered key reads its value from before it was buffered — and gets that value as the old value of each emission
+(KSC-127: KS uses the latest update's); its `queryableStoreName()` is `null`. An `untilBarrier()` table keeps its
+source's store and reads the source's current value. The buffer's changelog **follows the global `changelog.num-partitions` by default**, like
 every other store — no surface carries its own default — so set
 `.withChangelogNumPartitions(n)` only on a measurement. See `references/serdes-state-stores.md`.
 `untilWindowCloses` needs a windowed ancestor — on a non-windowed table it throws `TopologyValidationException`
@@ -77,6 +106,40 @@ as the windowed key over `inner`; only two DIFFERENT declared serdes (or window 
 then declare the windowed key serde downstream (sink `Produced`, `Repartitioned`, `Grouped`, `Materialized`); a
 windowed key reaching an undeclared site fails the build naming the site.
 
+**Windows and a timer backlog:** with event-time timers (any timer backend), the watermark waits while a
+backlog of more due timers than `timer-backend.max-cached-timers` drains — windows close (and finals emit) only after
+the timers before them fired, never before; the records that would move event time on wait in their buffers, so the
+verdicts are unchanged. With a custom `WatermarkGenerator` only the watermark waits and late-drop decisions can differ
+from an all-in-memory run. Nothing expires during a hold (window/session segments stay on disk).
+
+## Watermark alignment (🚀 Flink FLIP-217, not in Kafka Streams)
+
+`WatermarkStrategy.withWatermarkAlignment(group, maxAllowedWatermarkDrift[, updateInterval])` — Flink's signature —
+on each source of an alignment group. Semantics (not Flink's fetch pause):
+
+- A partition more than the drift ahead of a **lagging** partition of its group (one that delivered records and is
+  not idle) is **held**. It keeps being fetched; its records go only in timestamp order (records are never reordered).
+- When the held partition's next record is the oldest buffered one and a lagging partition has **nothing buffered**,
+  the **whole application waits** — every source, every group — until that partition delivers or is declared idle.
+  When every lagging partition has data, the record is dispatched (it *yields*).
+- Drift contract: the drift bound holds against lagging partitions with nothing buffered; against ones with data the
+  guarantee is timestamp order. Use **one out-of-orderness bound across the group** — differing bounds keep the
+  smaller-bound source held for good (build-time warning `alignment-mixed-watermark-bounds`).
+- **Sizing rule** for a sparse source with mean gap `G`: `maxAllowedWatermarkDrift ≥ G + b(sparse) − b(held)`, or the
+  application stops for most of each gap; a shorter `withIdleness(...)` on the sparse source bounds each wait instead,
+  at the risk of its later records being late.
+- **Idleness is required**: an aligned source with no idleness timeout (global `watermark.idleness-timeout-ms: 0` and
+  no `withIdleness`, a custom `idlenessTimeout()` of zero, `withIdleness(FOREVER)`) fails the build —
+  `alignment-idleness-off`, `error` by default (`topology.validation.alignment-idleness-off: warn|off` to override).
+- `updateInterval` (1 s default; the smallest across sources wins) bounds how far a newly-ahead partition overshoots.
+- The `TopologyTestDriver` does not model alignment; the two rules do run there (compile time).
+
+```kotlin
+val aligned = WatermarkStrategy.forBoundedOutOfOrderness<String, Order>(Duration.ofSeconds(5))
+    .withIdleness(Duration.ofMinutes(1))
+    .withWatermarkAlignment("orders-and-payments", Duration.ofSeconds(30))
+```
+
 ## Joins
 
 Joiners: `ValueJoiner<V1,V2,VR> = (left,right)->result`, `ValueJoinerWithKey<K,V1,V2,VR> = (k,left,right)->result`;
@@ -90,14 +153,17 @@ GlobalKTable joins only: `ValueJoinerWithStreamAndMappedKey<K,GK,V,GV,VR> = (str
   `{base}-right-store`), `.withChangelogNumPartitions(n)` (StoatFlow extension — **multiplied**: it sets
   the count on both buffers, plus `-outer-store` on LEFT/OUTER, so `(6)` is 12 or 18 partitions),
   `.withThisStoreSupplier`/`.withOtherStoreSupplier` (must retain duplicates —
-  `Stores.persistentWindowStore(..., retainDuplicates = true)` — or the build throws `KSC-99`),
+  `Stores.persistentWindowStore(..., retainDuplicates = true)` — and keep records for at least before + after + grace,
+  or the build throws `KSC-99`, as Kafka Streams' does; a timestamped or headers-aware `Stores` supplier is accepted too and builds the same plain buffer, since the
+  join keeps its serializers' headers in the stored values; a hand-written supplier whose builder is timestamped,
+  headers-aware or versioned is refused),
   `.withDslStoreSuppliers(StoreType.IN_MEMORY)` (both stores retain duplicates), `.withLoggingDisabled()`. **Unmatched left/outer results
   emit when the window closes** (watermark-driven), not on left-record arrival. A record whose window has **already
   closed** when it arrives (`ts + after` for a left record / `ts + before` for a right one, `+ grace`, at or behind the
   watermark) is never buffered: if unmatched, its null-side result is emitted at once under its own timestamp — Kafka
   Streams' late branch; only the clock differs (watermark vs KS stream time).
 - **Stream-table:** `stream.join(table, joiner, Joined?)` / `leftJoin` — point-in-time lookup (table
-  updates do **not** re-trigger); **no `outerJoin`**; key preserved; table must be materialized. With no re-key it
+  updates do **not** re-trigger); **no `outerJoin`**; key preserved; any readable table (below). With no re-key it
   reads the table on its own lane; after a re-key it reads it from another lane (see *Exactly-once reads* below). `Joined`
   settings other than `.as(name)` are **advisory** (serdes resolve from upstream `Consumed`/`Grouped`).
 - **Stream-GlobalKTable:** `stream.join(globalTable, keySelector, joiner, Named?)` / `leftJoin` — the
@@ -111,14 +177,30 @@ GlobalKTable joins only: `ValueJoinerWithStreamAndMappedKey<K,GK,V,GV,VR> = (str
   global overloads are **deprecated** (as in KS 4.4): their key is the *stream* key, not the lookup key. Under
   `exactly_once` the global table is read as of the stream record's commit — more consistent than KS (its global thread
   has no cut against the stream tasks); same API.
-- **Table-table:** `left.join(right, joiner, Named?, Materialized?)` / `leftJoin` / `outerJoin` — both
-  materialized; re-emits on either side's update; tombstone-aware.
+- **Table-table:** `left.join(right, joiner, Named?, Materialized?)` / `leftJoin` / `outerJoin` — re-emits on either
+  side's update; tombstone-aware. Every join reads a table through its **value getter**, as KS does: a source or
+  materialized table, a `filter` / `mapValues` / `transformValues` without `Materialized` (KSC-143), a suppressed table,
+  a windowed aggregation (KSC-142). Only a join result built without `Materialized`, and a table derived from one,
+  cannot be read — materialize it. A `transformValues` table read this way runs `transform()` on every lookup, in a
+  second transformer instance — one per reading thread, created and initialised once and reused — whose context
+  reports the looked-up key and value timestamp; a `schedule()` in its `init()` is ignored (WARN), and `transform()`
+  should not write stores, since every lookup writes again.
 - **Foreign-key:** `left.join(right, foreignKeyExtractor, joiner, TableJoined.as(name), Materialized?)` —
   extractor `(V)->KO?` or `(K,V)->KO?` (null FK ⇒ inner: no result, left: `joiner(left, null)`, KIP-962); a
   delete / FK change retracts with `(key, null)` materialized or not, as in KS (possibly for a key that never joined);
   **inner + left only (no outer)**; result
   keeps the left key. Java overloads take `Function`/`BiFunction` + `ValueJoiner`. `TableJoined.as(name)` is
-  its only effective setting.
+  its only effective setting. Keys match by their **serialized bytes** under the right table's key serde, as in KS:
+  the FK is filed after the round trip KS's subscription topic gives it (`ser(deser(ser(fk)))`), so the extractor
+  may return any class that serde serializes (a wrapper, a `byte[]`, a record of another schema version), and the
+  right table — a `filter`/`mapValues` over it included — is read with the FK as that serde deserializes it. An FK
+  the serde writes no bytes for (a null object, KSML's `DataNull`), or whose bytes it reads back as `null`, is no FK, like `null`; records are counted as
+  dropped (`stoatflow.dropped.records.total{reason=join_null_key}`) wherever KS counts them in `dropped-records`
+  (either join type, a right record with no key). A right key with no bytes fails the record, as in KS. One left
+  row's failing extractor, serde or joiner in a right-side update goes to the processing handler after the other
+  rows' results, never instead of them (a fatal error or a `FAIL` verdict stops at once); a left update that failed
+  before its subscription was written is caught up by a later update of the row — the first whose old and new values
+  extract and serialize (KS files the subscription on every update).
 - **Cogroup:** `KGroupedStream.cogroup((k,v,agg)->…)` → `CogroupedKStream`; chain `.cogroup(other){…}`;
   terminal `.aggregate(Initializer, Named?, Materialized?)`; windowable via `.windowedBy(...)` before
   `aggregate`. Legs may share a source (each record folds through every leg's aggregator); cogrouping the

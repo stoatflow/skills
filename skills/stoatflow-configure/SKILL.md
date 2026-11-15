@@ -19,7 +19,9 @@ Read `references/stoatflow-primer.md` first. **Do not invent config keys** — e
 2. **Typed `StreamsConfig.Builder`** (with `:core`) — `StreamsConfig.builder(applicationId, bootstrapServers)`
    + fluent setters, or `streamsConfigOverrides { … }` in the runtime builder. A Kafka Streams
    `Properties`/`Map` adapts in via `StreamsConfig.fromProperties(props).build()` / `fromMap(map).build()`
-   — see `references/ks-config-mapping.md`.
+   — see `references/ks-config-mapping.md`. The timer backend (`timerBackend(TimerBackend.TwoTier | RocksDB |
+   InMemory)`, YAML `stoatflow.timer-backend`) has no Properties/Map key: chain `.timerBackend(...)` after
+   `fromProperties(props)`; in `streamsConfigOverrides` it replaces the whole YAML `timer-backend` block.
 
 ```yaml
 stoatflow:
@@ -27,7 +29,7 @@ stoatflow:
   bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:-localhost:9092}
   processing-guarantee: EXACTLY_ONCE       # EXACTLY_ONCE (default) | AT_LEAST_ONCE
   lanes:
-    count: 16                              # default: max(2, CPU cores); recommended ≈ CPU × 4
+    count: 4                               # default: max(2, CPU cores / 4) per sub-topology
   state:
     dir: /var/lib/stoatflow/state
   rocks-db:
@@ -44,14 +46,18 @@ runtime:
 - **`stoatflow.processing-guarantee`** — `EXACTLY_ONCE` (default; atomic output+changelog+offsets) or
   `AT_LEAST_ONCE` (non-transactional, lower latency, duplicates possible on crash). This is the KSC-84
   divergence — KS defaults to at-least-once.
-- **`stoatflow.lanes`** — `count` (virtual-partition parallelism, ≈ CPU × 4; **not** Kafka partitions),
-  `queue-capacity` (300), `thread-type` (`VIRTUAL` default | `PLATFORM`).
+- **`stoatflow.lanes`** — `count` (virtual-partition parallelism per sub-topology, default `max(2, CPU cores / 4)`;
+  **not** Kafka partitions; raise it when a CPU-bound sub-topology lags while the CPU is idle), `queue-capacity`
+  (300), `thread-type` (`PLATFORM` default | `VIRTUAL` — many lanes for blocking I/O; engine-wide, a WARN at
+  startup for more `PLATFORM` lanes than cores).
 - **`stoatflow.commit-barrier`** — self-tuning barrier cadence: `interval-ms` (500 seed),
   `min-interval-ms`/`max-interval-ms` (150/5000), `timeout-ms` (60000; **must be > interval-ms**; cascades
   to producer `transaction.timeout.ms`/`max.block.ms`/`delivery.timeout.ms`). Plus EMA/epoch-sizing knobs.
-- **`stoatflow.state`** + **`stoatflow.rocks-db`** — `state.dir`, `state.uncommitted-max-bytes` (256 MiB —
-  bounded by default, the deliberate difference from KS's unbounded RocksDB), `rocks-db.preset`
-  (`LOW_MEMORY` 64 MiB / `DEFAULT` 256 MiB / `HIGH_PERFORMANCE` 1 GiB), `rocks-db.backend` (`AUTO`/`FFM`/`JNI`),
+- **`stoatflow.state`** + **`stoatflow.rocks-db`** — `state.dir`, `state.uncommitted-max-bytes` (256 MiB; KS's
+  default is 64 MiB), `state.interactive-query-isolation-level`
+  (`READ_UNCOMMITTED` default / `READ_COMMITTED` — what `store()` reads, KIP-892), `rocks-db.preset` (one block
+  cache shared by every store, memtables charged inside it: `LOW_MEMORY` 32 MiB / `DEFAULT` 128 MiB /
+  `HIGH_PERFORMANCE` 512 MiB — a budget, not a hard limit; KS gives each store its own), `rocks-db.backend` (`AUTO`/`FFM`/`JNI`),
   `rocks-db.metrics`, `state.format-downgrade` (`refuse` default | `wipe-and-restore` — see below).
 - **`stoatflow.dsl`** — `store-format` (`DEFAULT` | `HEADERS`): the global default for whether DSL-materialized
   stores (tables, `KTable` operators, table-table and FK join results, aggregations) persist the processing record's `Headers`
@@ -69,7 +75,8 @@ runtime:
   `create-topics-if-not-exist: false`, pre-create the engine's own changelogs too — `describe()` does not list
   them: `<app>-stoatflow-watermark-changelog` (1 partition; any windowed aggregation, time-based `suppress` or
   stream-stream join), `<app>-<store>-emitfrontier-changelog` per `onWindowClose()` aggregation,
-  `<app>-timer-store-changelog` for Processor API timers.
+  `<app>-timer-store-changelog` when a processor declares timer types (`declaredTimerTypes()`) on a persistent timer
+  backend with its changelog on.
 - **`stoatflow.watermark`** — `max-out-of-orderness-ms` (10000), `idleness-timeout-ms`, `auto-interval-ms`.
   `idleness-timeout-ms` is the **default** for sources that set no `WatermarkStrategy.withIdleness(...)` of
   their own; a per-source timeout wins for that source's partitions. `0` disables idleness only for the

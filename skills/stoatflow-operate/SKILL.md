@@ -1,6 +1,6 @@
 ---
 name: stoatflow-operate
-description: Deploy and run a StoatFlow app in production — the single-instance Kubernetes pattern (one active pod, never replicas > 1), HA active/standby mode, liveness/readiness probes, the runtime REST surface, metrics/observability, tuning (lanes, commit cadence, memory), and the production checklist. Use for deployment/ops; for application config keys use stoatflow-configure.
+description: Deploy and run a StoatFlow app in production — the single-instance Kubernetes pattern (one active pod, never replicas > 1), HA active/standby mode, liveness/readiness probes, the runtime REST surface, metrics/observability, tuning (lanes, commit cadence, memory), upgrades and rollback, and the production checklist. Use for deployment/ops; for application config keys use stoatflow-configure.
 license: Apache-2.0
 ---
 
@@ -30,10 +30,31 @@ StatefulSet rollout already gives the guarantee.) Full manifest in
 - **State:** a PVC (`volumeClaimTemplates`) mounted at `stoatflow.state.dir` — durable, but **not
   authoritative** (the changelog is the source of truth). It changes restart *speed* (delta restore), not
   correctness.
+- **Startup metadata:** before a restore StoatFlow describes every changelog and source topic and reads their
+  offsets (needs `Describe`). For KTable source-topic reuse it also needs `DescribeConfigs` on the source topics,
+  unless the source is pinned or reuse is off. A table restored from its source topic is restored up to the consumer
+  group's committed offset, which needs `Describe` on the group (implied by `Read`). An unreadable answer (a topic created moments ago included) is retried for
+  up to `stoatflow.state.restoration-metadata-timeout-ms` (30 s), then the start fails, naming the store (an
+  authorization or authentication error at once). A store is never wiped on an answer StoatFlow could not read. The
+  local state check — read-only, no data file opened, so cheap for any store size — is bounded by
+  `stoatflow.state.restoration-validation-timeout-ms` (30 s per store's check, from its own start; at most
+  `restoration-pool-size` at once; a stuck RocksDB open is not waited for), and every other startup probe of a store
+  directory (layout and format checks, the KTable source-switch check, the lock check before a deletion) gets the same
+  bound on its own. Both windows are short by design: the failed start stops the app, the pod restart recovers.
+- **One instance per state directory:** a store directory whose RocksDB lock another open holds fails the start, naming
+  the store and the likely holder (a second instance, or a store an earlier engine left open — a process restart
+  releases it); nothing is deleted.
+- **Don't flip a KTable's restoration source in place:** turning `ktable.auto-reuse-source-topics` off, or pinning a
+  table that restores from its source topic to a changelog, fails the start when the table's local state holds
+  source-topic offsets; the switch needs a rebuild (reset the group on the source topic to the earliest offset, delete
+  the store's local state, start). An in-memory table or a fresh disk has no such state: the start goes on with a WARN
+  naming the table (its changelog topic absent while the consumer group is past the source's start; read with
+  `Describe` on the group, no warning without it) — act on it with the same rebuild.
 - **Shutdown:** `terminationGracePeriodSeconds` ≥ `stoatflow.shutdown.timeout-ms` / 1000 (default 25 s) with
   margin (e.g. 60). SIGTERM → graceful drain.
-- **License:** inject `STOATFLOW_LICENSE_KEY` from a `Secret`; production **requires**
-  `STOATFLOW_LICENSE_ENVIRONMENT`.
+- **License:** inject `STOATFLOW_LICENSE_KEY` from a `Secret`; production and trial **require**
+  `STOATFLOW_LICENSE_ENVIRONMENT` (one `application.id` + environment = one licensed instance; replicas and an
+  HA pair count once). Instance limit, trial expiry and renewal: references/rest-and-metrics.md.
 
 ## The runtime REST surface (details in references/rest-and-metrics.md)
 
@@ -62,12 +83,17 @@ reference for the full behaviour and the embedded-`:core` caveat.
 
 ## Tuning levers (details in references/tuning.md)
 
-- **Lanes:** `stoatflow.lanes.count` (default `max(2, CPU cores)`) — start at cores for CPU-bound, 4×–8×
-  cores for I/O-bound; fixed at startup. Decoupled from Kafka partition count.
+- **Lanes:** `stoatflow.lanes.count` (default `max(2, CPU cores / 4)` per sub-topology, on `PLATFORM` threads) —
+  start at the default; raise toward the cores when a CPU-bound stateful sub-topology lags while the CPU is idle;
+  4×–8× cores with `lanes.thread-type: VIRTUAL` for blocking I/O. Fixed at startup; decoupled from partitions.
+- **Goal recipes** (low latency, high throughput, resource saver, blocking I/O, …) with measured trade-offs:
+  references/tuning.md → Goal recipes.
 - **Commit cadence self-tunes** between `commit-barrier.min-interval-ms` / `max-interval-ms` — you set the
   bounds, not the exact interval. `commit-barrier.timeout-ms` is a safety bound, not a cadence knob.
-- **Memory:** `stoatflow.state.uncommitted-max-bytes` (256 MiB — fires an early `MEMORY_PRESSURE` commit);
-  `stoatflow.rocks-db.preset` (`LOW_MEMORY` 64 MiB / `DEFAULT` 256 MiB / `HIGH_PERFORMANCE` 1 GiB).
+- **Memory:** `stoatflow.state.uncommitted-max-bytes` (256 MiB — fires an early `MEMORY_PRESSURE` commit; under
+  exactly-once it also counts the output held back during a commit, `stoatflow.eos.send.buffer.bytes`);
+  `stoatflow.rocks-db.preset` (the shared block cache, memtables charged inside it: `LOW_MEMORY` 32 MiB / `DEFAULT`
+  128 MiB / `HIGH_PERFORMANCE` 512 MiB; the image's `STOATFLOW_ROCKSDB_MB` reservation does not follow it).
 
 ## Store-format downgrade (record headers turned off)
 
@@ -98,6 +124,41 @@ key is StoatFlow's addition). Watch
 counted too, but startup fails immediately after, so a scrape will not catch it — detect a refusal from the
 crash-loop and the log line, not from this metric.
 
+## Upgrades and rollback: roll forward, not back
+
+A changelog record can carry a format version in the native header `__stoatflow.v`; a record without it is
+version 1. No release writes it yet (every changelog format is v1), but every restore path checks it: cold
+start, in-place restart, a standby's bootstrap and streaming, promotion. Every RocksDB store (key-value,
+versioned, timer, window, session) also records which local and changelog format versions it holds.
+
+- **A normal rolling update needs no upgrade ordering.** Only the new build reads what the new build writes.
+- **A build older than the data refuses, by design — unlike Kafka Streams**, whose KIP-796 changelog version
+  header only WARNs. A newer changelog record fails `StoatFlow.start()` with
+  `io.stoatflow.core.exception.ChangelogFormatException` (the message names store, topic, partition, offset,
+  the version found and the versions this build reads); the app goes to `ERROR`, local state is kept,
+  nothing from that poll is applied. A store whose local state holds newer data (a newer layout-stamp schema,
+  or changelog records in a newer format) refuses at start with `StoreLayoutMismatchException` saying "this
+  build is older than the data", local state kept, whatever `stoatflow.state.layout-mismatch` says, when it
+  has a changelog or source topic. On Kubernetes: CrashLoopBackOff until a build that reads the data runs.
+  **There is no skip or wipe option** — the changelog is the only copy. The remedy is to deploy a newer build;
+  do not advise deleting state or topics.
+- **The rollback bound is the newest build whose records a store holds, not the last build that ran.** A store
+  remembers the highest changelog format it ever held; a rollback does not lower it. After N+1 → N, a further
+  step back to N−1 is refused at start if N+1 wrote records N−1 cannot read. A store with no changelog (a
+  source-topic table, logging disabled) holds no changelog records: only its local format governs it.
+- **A rollback across a local-only format change works:** the older build WARNs, deletes the store's local
+  state and rebuilds it from its changelog or source topic (one full restore). A store with **no recovery
+  source** refuses instead, or starts **empty** under `stoatflow.state.layout-mismatch: wipe-and-restore`.
+- **`layout-mismatch` scope:** still `refuse` (default) or `wipe-and-restore`, still consulted only for a store
+  with no recovery source (`withLoggingDisabled()`, or the changelog globally disabled, and no source topic to restore
+  from). There it now also
+  covers a rollback (a newer local format or layout-stamp schema). A store holding changelog records newer
+  than the build is never wiped.
+- **HA pair:** a paused rollout or a rollback can put an older pod in front of a newer pod's records. An older
+  standby meeting one terminates its pod (restarts, fails again); an older pod promoting releases the
+  promotion token so a peer that reads the data takes over; if the newer active is gone, there is **no active**
+  until the rollout moves forward.
+
 ## Metrics & alerts (details in references/rest-and-metrics.md)
 
 `GET /metrics` (Prometheus). `runtime.metrics.naming: stoatflow | kafka-streams | both` — use `both` to
@@ -116,13 +177,23 @@ watermark stall.
       `<app>-<store>-changelog` **and** the engine's own, which `describe()` does not list:
       `<app>-stoatflow-watermark-changelog` (1 partition; any windowed aggregation, time-based `suppress` or
       stream-stream join), `<app>-<store>-emitfrontier-changelog` per `onWindowClose()` aggregation,
-      `<app>-timer-store-changelog` for Processor API timers. Startup names any that is missing.
+      `<app>-timer-store-changelog` when a processor declares timer types (`declaredTimerTypes()`) on a persistent
+      timer backend with its changelog on. Startup
+      names any that is missing.
+- [ ] Mirroring changelogs to another cluster? Replicate them **with their record headers** (MirrorMaker 2
+      does): the changelog format version is a native header, and a replicator that drops headers makes every
+      record read as version 1.
+- [ ] Upgrades roll forward; a rollback is bounded by the newest build whose records a store holds.
 - [ ] Processing guarantee chosen on purpose; downstream consumers match.
 - [ ] License injected as a secret; readiness wired to license health.
 - [ ] `/health/ready` (readiness) + `/health/live` (liveness) + a generous `startupProbe`.
 - [ ] `/metrics` scraped; alerts on lag / commit stalls / errors / restoration.
-- [ ] Exception + deserialization handlers chosen; DLQ provisioned and monitored.
-- [ ] Resources sized (CPU/memory for one process, lanes for cores); `-XX:+UseG1GC`.
+- [ ] Output topics created before the start — every sink topic and every DLQ topic: a missing one refuses the start
+      (`MissingOutputTopicException`, naming it; `validation.validate-output-topics`, on by default). Topics a
+      `TopicNameExtractor` picks per record are not checked — create those too.
+- [ ] Exception + deserialization handlers chosen; DLQ monitored.
+- [ ] Resources sized (CPU/memory for one process; lane count checked against the load — the default is
+  2 per sub-topology up to 11 cores); `-XX:+UseG1GC`.
 
 ## See also
 

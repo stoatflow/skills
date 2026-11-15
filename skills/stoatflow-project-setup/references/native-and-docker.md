@@ -17,7 +17,7 @@ stoatflow {
         stateDir.set("/data/state")                     // default: /data/state
         rocksdbMb.set(256)                              // default: auto-detect
         reproducibleBuild.set(true)                     // default: true (git-commit timestamp)
-        jvmFlags.set(listOf("-XX:+UseG1GC"))            // overridable; preview/native-access always added
+        jvmFlags.set(listOf("-XX:+UseG1GC"))            // overridable; native-access always added
     }
 }
 ```
@@ -31,7 +31,14 @@ mvn -Pstoatflow-docker package  # build + jib image to the local daemon, one com
 ```
 
 Reproducible build, default base `eclipse-temurin:25-jre-noble`, port 8080, user `1000:1000`, entrypoint
-`/app/stoatflow-entrypoint.sh` (container-aware heap).
+`/app/stoatflow-entrypoint.sh` (container-aware heap). The image's **entrypoint** is the whole JVM command line: the
+script, the mandatory flags + `jvmFlags`, then `-cp @/app/jib-classpath-file @/app/jib-main-class-file` (under Jib's
+`container.appRoot`), so `mainClass` must be set (a Gradle Jib task fails unless `stoatflow.mainClass` or Jib's
+`container.mainClass` is; the Maven `configure` goal refuses too). `CMD` is empty: container arguments
+(`docker run <image> …`, Kubernetes `args:`) reach the app's `main`. Never override the entrypoint
+(`--entrypoint`, Kubernetes `command:`); add JVM options through `jvmFlags` or `JAVA_TOOL_OPTIONS`. Images built before
+1.0.0-rc.5 had the script alone and exited at start; workaround: pass `--enable-native-access=ALL-UNNAMED
+-XX:+UseG1GC -cp @/app/jib-classpath-file <main class>` as the container's arguments.
 
 ## GraalVM native image
 

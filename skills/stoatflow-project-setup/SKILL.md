@@ -1,6 +1,6 @@
 ---
 name: stoatflow-project-setup
-description: Set up a project that uses StoatFlow — Gradle or Maven build, the dependency coordinates, the PRIVATE StoatFlow Maven repository (maven.stoatflow.io) and its credentials, the license key, JDK 25 with preview flags, the io.stoatflow Gradle plugin / Maven parent+BOM+plugin, Docker (Jib), and GraalVM native image. Use for build/dependency/repo wiring; for application config keys use stoatflow-configure.
+description: Set up a project that uses StoatFlow — Gradle or Maven build, the dependency coordinates, the PRIVATE StoatFlow Maven repository (maven.stoatflow.io) and its credentials, the license key, JDK 25 or newer and the JVM flags, the io.stoatflow Gradle plugin / Maven parent+BOM+plugin, Docker (Jib), and GraalVM native image. Use for build/dependency/repo wiring; for application config keys use stoatflow-configure.
 license: Apache-2.0
 ---
 
@@ -49,7 +49,7 @@ dependencies {
 ```
 
 The `io.stoatflow` convention plugin applies `application` + `shadow` (fat JAR), the JDK-25 toolchain,
-`--enable-preview`, and the `integrationTest` task — so you don't wire JVM flags by hand. Resolving the
+`--enable-native-access=ALL-UNNAMED`, and the `integrationTest` task — so you don't wire JVM flags by hand. Resolving the
 plugin needs the private repo in **`pluginManagement`** too (see `references/build-setup.md`).
 
 ## Maven (full snippets in references/build-setup.md)
@@ -62,17 +62,20 @@ a property there). Config knobs go in `<properties>` (`stoatflow.mainClass`, `st
 
 ## License key
 
-Set **`STOATFLOW_LICENSE_KEY`** (value starts `key/…`, from your onboarding email). Precedence: env var >
+Set **`STOATFLOW_LICENSE_KEY`** (value starts `key/…`, from your onboarding email; a free trial key is requested at
+`https://stoatflow.io/contact`, a commercial one from `sales@stoatflow.io`). Precedence: env var >
 `-D` system property > `application.yaml` (`stoatflow.license.key`). In `application.yaml`, interpolate to
-keep the literal out of VCS: `key: ${STOATFLOW_LICENSE_KEY}`. **Production requires
-`STOATFLOW_LICENSE_ENVIRONMENT`** explicitly (local dev auto-derives `<user>-<host>`; GitHub Actions
-auto-derives `cicd-<run id>`). Deferred validation means short-lived test/CI instances consume zero seats.
+keep the literal out of VCS: `key: ${STOATFLOW_LICENSE_KEY}`. **Production and Trial deployments require
+`STOATFLOW_LICENSE_ENVIRONMENT`** explicitly — e.g. `prod`, `staging`; in Kubernetes the auto-generated hostname
+is the pod name, so every redeploy would count as a new instance (a Developer key on a laptop auto-derives
+`<user>-<host>`; GitHub Actions auto-derives `cicd-<run id>`). One `application.id` + environment is one licensed
+instance; replicas and an HA pair count once. Deferred validation means short-lived test/CI instances never count.
 
 ## JDK & flags
 
-**JDK 25** at build and runtime. Two flags everywhere (compile, test, run): **`--enable-preview`** and
-**`--enable-native-access=ALL-UNNAMED`** (RocksDB uses the FFM API); `-XX:+UseG1GC` is on by default. The
-`io.stoatflow` Gradle plugin / Maven parent set these for you.
+**JDK 25 or newer.** CI tests JDK 25 and the newest JDK release (27 today). One flag at test and run time:
+**`--enable-native-access=ALL-UNNAMED`** (RocksDB uses the FFM API); `-XX:+UseG1GC` is on by default. No preview
+flag is needed. The `io.stoatflow` Gradle plugin / Maven parent set these for you.
 
 ## Build & run
 

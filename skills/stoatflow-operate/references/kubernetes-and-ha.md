@@ -31,7 +31,7 @@ spec:
           env:
             - name: STOATFLOW_LICENSE_KEY
               valueFrom: { secretKeyRef: { name: stoatflow-license, key: license-key } }
-            - name: STOATFLOW_LICENSE_ENVIRONMENT   # REQUIRED in production
+            - name: STOATFLOW_LICENSE_ENVIRONMENT   # REQUIRED in production and trial
               value: production
           readinessProbe: { httpGet: { path: /health/ready, port: http }, periodSeconds: 5,  timeoutSeconds: 3, failureThreshold: 3 }
           livenessProbe:  { httpGet: { path: /health/live,  port: http }, periodSeconds: 10, timeoutSeconds: 3, failureThreshold: 3 }
@@ -49,6 +49,10 @@ spec:
         resources: { requests: { storage: 100Gi } }
 ```
 
+- The image built by the StoatFlow plugins (Jib) carries the JVM flags and the main class in its **entrypoint**:
+  `args:` on the container are the application's own `main` arguments, and `command:` must stay unset — it would
+  replace the entrypoint, flags and heap sizing included. Images built before 1.0.0-rc.5 had no command at all and
+  exited at start (see the project-setup skill's docker reference for the workaround).
 - Point `stoatflow.state.dir` at the mounted PVC. State is durable but **not authoritative** (changelog is
   the source of truth) — the PVC changes restart *speed* (delta restore), not correctness.
 - `/health/ready` returns 503 until restoration completes; verify with
@@ -74,6 +78,15 @@ Key config (defaults):
 | `stoatflow.ha.max-standbys` | `3` | hard ceiling (total instances ≤ max-standbys + 1) |
 | `stoatflow.ha.failover-priority` | `0` | tie-break within the equal-lag bucket (never overrides lag) |
 
+Coordination-topic credentials: its three clients connect and authenticate exactly like their processing
+counterparts, taking their `security.*`/`ssl.*`/`sasl.*` keys and `client.dns.lookup` — the producer from
+`stoatflow.kafka.producer` over the consumer's, the admin client (creates the topic) from
+`stoatflow.kafka.admin`, the consumer (reads it like a restoration consumer) from
+`stoatflow.kafka.restoration-consumer`. One principal: set the credentials once under
+`consumer`. A principal per client: the producer's needs `Write` on the topic, the consumer's `Read`, the
+admin's `Describe` (+ `Create` when relying on auto-creation, + `DescribeConfigs` for the startup
+compaction check, skipped without it). A failed topic creation's error lists these permissions.
+
 Deployment: same `StatefulSet` + `RollingUpdate`, but `replicas: 2`; wire `POD_NAME` from the downward API
 → `stoatflow.ha.pod-id`; a headless `Service`. Readiness gate: the active is Ready while processing; a
 standby is Ready only once caught up; a still-catching-up standby keeps liveness UP so it isn't killed.
@@ -88,8 +101,19 @@ standby is Ready only once caught up; a still-catching-up standby keeps liveness
 
 Correctness: `?force=true` overrides only the *readiness* check — a forced promotion still fully restores to
 the committed changelog before processing. Split-brain is impossible under EOS (broker producer-epoch
-fence) and bounded-duplicate under ALO (the promotion token is the fence). Pausing the active does **not**
-promote a standby.
+fence) and bounded-duplicate under ALO (the promotion token is the fence). Under ALO the active writes each epoch's
+state to the changelogs at that epoch's commit, after its output is acknowledged, so a standby trails it by up to one
+commit. Pausing the active does **not** promote a standby.
+
+Tables restored from their source topic (a `table()` over a compacted topic, `globalTable()`, a read-only store): a
+standby applies the source topic only up to the consumer group's committed offset — reading it, with `Describe` on the
+group, every `stoatflow.ha.heartbeat-ms` while it holds a partition there, with the topic's end offsets (a caught-up
+standby, idle or busy: two small requests per heartbeat) — never the records the active has read but not committed;
+their lag counts what the standby may still apply (from the topic's end while the offsets cannot be read; unknown —
+the largest long, never caught up — while the end cannot be read either). A table
+standing past its topic's end — the topic re-created or truncated under the standby — is rebuilt from the topic; a
+promotion that finds one fails once, and the next start restores it in full. A promotion, a cold start and an in-place restart bring each such
+table exactly to the offset processing resumes from, so a `groupBy` over it stays exact across a failover (GA A2.37).
 
 ### Application faults under HA
 
@@ -122,6 +146,12 @@ Operational consequences worth telling a user about:
   build that this pod does not recognise shows as `UNKNOWN` on its `/ha/status`. The peer still counts as
   alive but takes part in no promotion decision on that pod. It means "finish the upgrade", not "something
   is broken".
+- **An older pod in front of a newer pod's data refuses.** A paused rollout or a rollback across a changelog
+  format change: an older standby that meets a newer-format changelog record terminates its pod
+  (`ChangelogFormatException` in the log; it restarts and fails again); an older pod promoting releases the
+  promotion token so a peer that reads the data takes over; if the newer active is gone there is no active
+  until the rollout moves forward. Advise rolling forward, never deleting state — the changelog is the only
+  copy. A normal rolling update needs no upgrade ordering. Full rules: SKILL.md → Upgrades and rollback.
 - **`stoatflow.ha.restarting`** (0/1 gauge) is the dashboard signal: the pod stays `ACTIVE` throughout, so
   `stoatflow.ha.role` does not move. `stoatflow.engine.restart.total{trigger=replace_thread}` counts them.
 - **A source-topic-set change restarts the active in place too** (ADR-143): a topic newly matching a
@@ -136,14 +166,28 @@ Operational consequences worth telling a user about:
   that 10 s check; records already consumed from the deleted topic are still named in the in-flight offset
   commit, which the broker rejects retriably and the client retries without end. Symptom before the fix: the pod
   stops committing and sits in `RESTORING` with no error — the restart begins and its teardown hangs. Advise
-  draining a topic rather than deleting it under load, and expect a pause of about a minute at the defaults
-  even with the fix (measured ~66 s): it is dominated by the commit already in flight when the topic went
-  away running out `barrier-timeout-ms`, not by the 10 s detection window.
+  draining a topic and deleting it once idle, rather than deleting it under load. A topic deleted while records
+  from it are still being consumed costs a pause of about a minute at the defaults even with the fix (measured
+  ~66 s): it is dominated by the commit already in flight when the topic went away running out
+  `barrier-timeout-ms`, not by the 10 s detection window. An idle topic is not named in the commits outside its
+  keep-alive (a commit names only partitions that moved), so its deletion costs the detection window plus the restart.
   **This cost is HA-specific, and applies to PATTERN-matched topics.** Without HA the app uses a consumer group,
   so deleting a pattern-matched topic arrives as a revocation within ~130 ms, is classified as a gone topic (not
   a second instance), and an in-place `ABORT` restart has it committing again in ~0.5 s stateless / ~1 s
   stateful. Do not quote the ~66 s figure for a non-HA deployment. A deleted *literal* source topic stays fatal
   either way (KS-exact) — advise a pattern source for topics that are expected to come and go.
+- **Under HA, the brokers' `offsets.retention.minutes` must be at least a day** (default 7 days). The active's
+  `assign()` group has no members, so Kafka expires each partition's committed offset that long after its last
+  commit; StoatFlow re-commits every source partition's offset about 15 minutes after a pod becomes active and every
+  12 hours after, records or not. Below a day, an idle partition's offset can expire and the next active resumes it
+  from `auto.offset.reset`. The same re-commit keeps the exactly-once `transactional.id` alive (any mode) — keep
+  `transactional.id.expiration.ms` at a day or more too.
+- **Under exactly-once, advise `auto.create.topics.enable=false` on the brokers before deleting a pattern-matched
+  topic** (HA or not). With the Kafka 4.4 client the producer keeps asking, with
+  auto-creation allowed, for the topics it committed offsets for in roughly the last 10 minutes, so on a permissive
+  broker it can re-create a deleted topic, empty, before StoatFlow drops it — the pattern then matches it again.
+  StoatFlow commits a partition's offset when it moves, about 15 minutes after the application starts and every 12
+  hours, so a topic is exposed for about 10 minutes after each of those and not otherwise. Kafka Streams 4.4 has the same exposure.
 - Since 1.0.0-beta.8 a terminal failure publishes the hand-off from the state transition itself, so it no
   longer depends on anything calling `close()`. Before that, an **embedded `:core`** deployment (no
   `:runtime` wrapper, no user `close()`) left a dead engine heartbeating as a healthy active and the

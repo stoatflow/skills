@@ -64,15 +64,14 @@ dependencies {
 
 The plugin unconditionally applies: `application`, `com.gradleup.shadow` (fat JAR classifier `all`), the
 JDK-25 toolchain, Kotlin `jvmToolchain(25)` (only if the Kotlin plugin is present — it is **not** bundled),
-`--enable-preview` on compile, and the `integrationTest` task (JUnit-Platform, tag `IntegrationTest`).
+`--enable-native-access=ALL-UNNAMED` on test and run (plus `-XX:+UseG1GC` on run), and the `integrationTest`
+task (JUnit-Platform, tag `IntegrationTest`).
 
 **Without the plugin** (configure JVM flags yourself):
 ```kotlin
 java { toolchain { languageVersion = JavaLanguageVersion.of(25) } }
-tasks.withType<JavaCompile> { options.compilerArgs.add("--enable-preview") }
 application {
-    applicationDefaultJvmArgs = listOf(
-        "--enable-preview", "--enable-native-access=ALL-UNNAMED", "-XX:+UseG1GC")
+    applicationDefaultJvmArgs = listOf("--enable-native-access=ALL-UNNAMED", "-XX:+UseG1GC")
 }
 ```
 
@@ -140,4 +139,25 @@ that's how Maven applies your credentials. Profiles activate with `-P` (e.g. `-P
 
 **Corporate-parent path (BOM only, no StoatFlow parent):** import `stoatflow-bom` (`<type>pom</type>
 <scope>import</scope>`) in `<dependencyManagement>` with an explicit `${stoatflow.version}` property, and
-wire the compiler `--enable-preview` + JVM run flags yourself.
+wire `maven.compiler.release` 25 + the JVM run flags yourself.
+
+## Preview features in your own code
+
+StoatFlow uses no JDK preview features; neither the plugin nor the parent adds `--enable-preview`, and no knob
+does. If the app's own code uses preview features, add the flag yourself. **Gradle:**
+`tasks.withType<JavaCompile> { options.compilerArgs.add("--enable-preview") }`, `jvmArgs("--enable-preview")`
+on the `test`, `integrationTest` and `run` tasks, and for the image
+`stoatflow { docker { jvmFlags.set(listOf("-XX:+UseG1GC", "--enable-preview")) } }` (setting `jvmFlags`
+replaces the default list, so keep `-XX:+UseG1GC`). **Maven:** append it to `stoatflow.jvmArgs` and
+`stoatflow.testJvmArgs` (they replace the defaults — e.g.
+`${stoatflow.mandatoryJvmArgs} -XX:+UseG1GC --enable-preview`), to `stoatflow.docker.jvmFlags`, and to
+maven-compiler-plugin's `<compilerArgs><arg>--enable-preview</arg></compilerArgs>`.
+
+## Building on a newer JDK
+
+The plugin sets the JDK 25 toolchain, and the app runs on JDK 25 or newer either way (CI tests 25 and the newest
+release). To build on a newer toolchain, override it after `plugins { }` and pin the bytecode to 25 — Kotlin 2.4 has
+no JVM 27 target, and KGP refuses differing Java and Kotlin targets: `java { toolchain { languageVersion.set(
+JavaLanguageVersion.of(27)) } }`, `kotlin { jvmToolchain(27); compilerOptions { jvmTarget.set(JvmTarget.JVM_25) } }`,
+`tasks.withType<JavaCompile>().configureEach { options.release.set(25) }`. Maven needs nothing: the parent already
+compiles to release 25 / jvmTarget 25 whichever JDK Maven runs on.

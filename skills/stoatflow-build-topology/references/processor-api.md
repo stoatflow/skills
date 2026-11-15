@@ -64,10 +64,41 @@ class UppercaseProcessor : ContextualFixedKeyProcessor<String, String, String>()
 ```
 
 **Context:** `forward(record)` / `forward(key, value[, timestamp])` / `forward(record, childName)` (fixed-key:
-`forward(value[, timestamp])`, `key()` reads the fixed key). Metadata/time: `timestamp()`, `headers()`,
+`forward(value[, timestamp])`, `key()` reads the fixed key — the record's in `process()`, the timer's in `onTimer`, a
+kept context's too; in `init()`, `close()` and a punctuator both throw `IllegalStateException`: forward a
+`FixedKeyRecord` there. Neither exists on Kafka Streams' `FixedKeyProcessorContext`). Metadata/time: `timestamp()`, `headers()`,
 `topic()`/`partition()`/`offset()`, `applicationId()`, `currentWatermarkMs()`, `currentStreamTimeMs()` (KS
 alias for the watermark), `currentSystemTimeMs()` (system clock; the driver's wall clock under the
-`TopologyTestDriver`), `getStateStore(name)`, `isLate()` (in `process`).
+`TopologyTestDriver`), `getStateStore(name)`, `isLate()`. `headers()` is the record being processed
+— the same instance as `record.headers()`, headers set upstream with `forward(record.withHeaders(...))` included —
+in `onTimer` the timer's headers — those of the record that armed it (*Timer headers* below) — and empty in punctuators
+and `init()`. All five record accessors — `timestamp()`,
+`headers()`, `topic()`, `partition()`, `offset()` — follow the callback they are called in, so a context kept from
+`init()` always reports one record: in `process()` the record and its source coordinates (past an in-memory
+`repartition()` or re-key boundary, the source record's — Kafka Streams reports its repartition topic's); in `onTimer`
+the timer's time, in a punctuator the punctuation's, with `""` / `-1` / `-1` for topic, partition and offset — also for
+what those callbacks (or a scheduled source, or a window's final result emitted on a watermark advance) forward; in a
+`suppress` result the record it was buffered with (as in Kafka Streams); in `init()` and `close()` the wall clock when
+read and `""` / `-1` / `-1`. They describe the calling thread's record: read them in the callback — a thread you start
+(an executor task, a `CompletableFuture`) sees no record. A kept context's `forward(...)` works in `onTimer` like the
+`TimerContext`'s; a `forward(...)` in `init()`, `close()` or a thread you start has nothing to forward downstream of and
+is dropped (one WARN per processor).
+
+`isLate()` is true only for an **arrival** — a record a topic delivered, or one forwarded from it (an aggregation's or a
+join's update included, judged by the timestamp it is forwarded with), whose timestamp is below the watermark. What a
+timer, a punctuator or a scheduled source produces is never late, nor a window's final result emitted on a watermark
+advance or a `suppress(untilWindowCloses | untilTimeLimit)` result, nor what they forward: below the watermark by
+construction. An `untilBarrier()` flush is judged against the watermark its update arrived under (`emit.mode =
+on-barrier` leaves `isLate()` unchanged, a downstream re-stamp included). False in timer and punctuator callbacks.
+
+**Timestamps: any `Long` but `Long.MIN_VALUE`.** Negative times are valid event times (windows, joins, timers,
+punctuators handle them). `Long.MIN_VALUE` is StoatFlow's "no event time", and passing it as a time throws
+`IllegalArgumentException`: a `Record` / `FixedKeyRecord` (constructor, `withTimestamp`, …), every
+`forward(key, value, timestamp)` (a punctuator's too), timer registration in both domains, an anchored punctuator's
+`startTime`, a scheduled source's `forward`. `currentWatermarkMs()` / `currentStreamTimeMs()` return `Long.MIN_VALUE`
+before the first watermark, so `record.withTimestamp(context.currentStreamTimeMs())` throws there (Kafka Streams'
+`Record` likewise rejects its initial stream time, `-1`). A negative-time record reaching a sink is written without a
+timestamp — the producer or broker stamps the wall clock, counted as `stoatflow.sink.records.negative.timestamp.total`.
 
 **Several parents (KS parity):** a child connected to one parent twice (`addProcessor("x", s, "p", "p")`)
 gets a plain `forward` once **per connection** and a named `forward(record, "x")` **once**. A node with
@@ -143,6 +174,19 @@ topology.addSource(AutoOffsetReset.Earliest, strategy, "orders-src", "orders")
 `stoatflow.watermark.idleness-timeout-ms` for that source's partitions; a source that sets none inherits
 it. This is a StoatFlow extension — Kafka Streams has no `addSource(WatermarkStrategy, …)`.
 
+**Extractors and missing times (DSL sources too).** A `TimestampExtractor`'s `partitionTime` argument is the
+partition's real partition time — the highest event time extracted from that partition before the record, restored
+from the committed offsets after a restart (`-1` while unknown, as in Kafka Streams). An extractor or assigner that
+returns `Long.MIN_VALUE` skips the record, and so does Kafka's `-1` ("no timestamp") on a source with neither; the
+skip is counted as `stoatflow.dropped.records.total{reason=no_event_time}` (WARN at most once a minute per partition)
+and its offset committed. A `-1` an extractor reads from the payload is a time. `Long.MAX_VALUE` is a valid time too.
+Kafka Streams' built-in extractors ship in `io.stoatflow.core.processor`, behaving as in KS — each of the first three
+treats every negative Kafka timestamp as invalid: `FailOnInvalidTimestamp` (fails the application, not restartable),
+`LogAndSkipOnInvalidTimestamp` (skips and counts the record), `UsePartitionTimeOnInvalidTimestamp` (uses the partition
+time; throws while it is unknown), and `WallclockTimestampExtractor` (processing time). Use one per source
+(`Consumed.withTimestampExtractor(...)`, `addSource(extractor, …)`) or globally (`default.timestamp.extractor`) to
+refuse negative times as Kafka Streams does; an extractor's exception fails the application.
+
 **Implementing `WatermarkStrategy` yourself?** If its timestamp assigner reads the event time from the key, the
 value or the headers, `hasCustomTimestampAssigner()` must return `true` (the built-ins set it when you call
 `withTimestampAssigner`). StoatFlow trusts the flag: it orders partitions by event time with it, and counts a
@@ -168,6 +212,13 @@ per-key time-triggered mutation, prefer a **timer** (`onTimer` runs in the same 
   decrement / reset / delete of it is lost. Fix under investigation. Until then, do such time-triggered per-key changes
   from a **timer** (`onTimer` is serialized with the key's records); punctuators that only read, or write keys
   `process()` never updates, are unaffected.
+- **After a crash under `at_least_once`, no state change is durable before its output** — a punctuator's, an
+  `onTimer` call's, a record's, a downstream sub-topology's: each commit waits for the epoch's output to be
+  acknowledged before the cached stores send their changelog records and the timer, versioned and `lruMap` stores
+  release theirs, held until that commit. Output and state are kept or lost together; lost, the work runs again from the
+  committed state — at most a duplicate (Kafka Streams can lose a punctuator's output here). Cost: those three stores'
+  changelogs and an HA standby trail by up to one commit; held writes count toward the uncommitted-state memory limit.
+  Not covered: an output whose send fails.
 - **Reads are as of the lane's commit under `exactly_once`:** `process`, `onTimer` and punctuators never see another
   lane's uncommitted next-commit write (except from `lruMap` / in-memory versioned stores, above). IQ and
   `at_least_once` read the latest state.
@@ -181,12 +232,13 @@ per-key time-triggered mutation, prefer a **timer** (`onTimer` runs in the same 
 resolve to the same constants. `PunctuatorMode.BLOCKING` (default) / `NON_BLOCKING`. Anchored overload takes
 `startTime: Instant` (KIP-1146). Locked-run: an overlapping fire is skipped.
 
-**Fire times (Kafka Streams' `PunctuationSchedule`):** `STREAM_TIME` is aligned to 0 — it fires on the first data (the
-first watermark ≥ 0), then at every multiple of the interval; `WALL_CLOCK_TIME` first fires one interval after it was
-scheduled, then on that grid; anchored fires at `startTime`, or at the first grid point after now when `startTime` is
+**Fire times (Kafka Streams' `PunctuationSchedule`):** `STREAM_TIME` fires on the first data — the first watermark,
+negative or not — then on the grid aligned to 0 (every multiple of the interval); for a first watermark ≥ 0 that is
+exactly Kafka Streams' schedule, and a negative one fires with a negative punctuation time. `WALL_CLOCK_TIME` first
+fires one interval after it was scheduled, then on that grid; anchored fires at `startTime`, or at the first grid point after now when `startTime` is
 already behind. A jump past several grid points fires once (with the current time), then the next grid point — no drift.
 Inside the callback `context.timestamp()` is the punctuation time and `headers()` is empty (Kafka Streams parity) —
-not the last record's.
+not the last record's; it is one instance for the punctuation, so a header added there rides its `forward(key, value)`.
 
 **Start timing (Kafka Streams parity):** `init()` runs when the application starts — not with the first record —
 so a punctuator scheduled there (catch-up, heartbeat, TTL cleanup) runs even if no input arrives. One instance per
@@ -196,23 +248,40 @@ their first record. In HA active/standby, `init()` runs when a pod becomes activ
 
 ## Timers (🆕 Flink-style)
 
-Override `declaredTimerTypes(): Set<TimeNotion>` (registering an undeclared type throws). `context.timerService()`
+Override `declaredTimerTypes(): Set<TimeNotion>` (registering an undeclared type throws). Declaring `EVENT_TIME` makes
+the topology need a watermark: refused (`TopologyValidationException`) under `timestampCoordinationMode = DISABLED`,
+beside a `noWatermarks()` source, or with no Kafka topic — by the TopologyTestDriver too. The timer store and its
+`<app>-timer-store-changelog` topic exist only when some processor declares a timer type, on every timer backend (the
+`MEMORY` backend keeps the store in memory); once none does, the local `timer-store` directory is cleaned up as stale and its timers stop
+firing (they come back from the changelog if timers are declared again — lost instead when the timer backend keeps no
+changelog, ran without one at some point, or state restoration is off, which a start-up WARN names; a
+`processor.wrapper.class` decorator that does not forward `declaredTimerTypes()` drops the declaration too).
+`context.timerService()`
 → `TimerService<K>`: `registerEventTimeTimer(key, ts)`, `registerProcessingTimeTimer(key, ts)`,
-`deleteEventTimeTimer(...)`, `deleteProcessingTimeTimer(...)`, `currentWatermark()`, `currentProcessingTime()`.
+`deleteEventTimeTimer(...)`, `deleteProcessingTimeTimer(...)`, `currentWatermark()`, `currentProcessingTime()`,
+plus the 🆕 named members below and the 🆕 `headers` overloads (*Timer headers*).
+An event-time timer fires when the watermark **reaches** its time (watermark ≥ ts), a processing-time one when the wall
+clock does (≥). A timer registered already due — at or before the current watermark / wall clock — never fires inside
+the registering call: the next collection pass fires it (every watermark advance, and the wall-clock tick,
+`processing.wall-clock-advance-interval-ms`, 10 ms default), milliseconds later, with no new input needed.
 Handle in `onTimer(timestamp, key, TimerContext)` — `TimerContext` gives `forward(...)`,
-`getStateStore(name)` (read/write), `timerService()`, `timestamp()`, `timeDomain()`. Timers dedup by
+`getStateStore(name)` (read/write), `timerService()`, `timestamp()`, `timeDomain()`, `headers()`, `timerName()` (`null`
+for an unnamed timer; `FixedKeyTimerContext` has both). Unnamed timers dedup by
 `(key, timestamp)` and fire once — also when re-registered from the key's own lane while already due and queued on it —
 and a delete from that lane cancels a queued fire (`onTimer` does not run); a write from another lane or a punctuator
 follows the cross-lane rule below. Behind a re-key, a due timer's `onTimer` waits until the latest commit boundary has
-reached its lane (as re-keyed records do). Re-arming the same `(key, timestamp)` from its own `onTimer` is a new timer that
-fires once more. Persistent backend survives restart. A timer key must not be `null` —
-`register*`/`delete*` throw `IllegalArgumentException("Timer key must not be null")`. Re-registering from `onTimer` via
-`context.timerService()` works in event and processing time. An `onTimer` throw, or a key that fails to deserialize at
+reached its lane (as re-keyed records do). Re-arming the same `(key, timestamp)` from its own `onTimer` is a new, already-due timer that
+fires once more, at the next collection pass. Timers survive a restart on every backend: `MEMORY` restores them from the timer changelog (on by
+default), the on-disk backends also keep them locally. A timer key must not be `null` —
+`register*`/`delete*` throw `IllegalArgumentException("Timer key must not be null")`; a timer timestamp may be any
+`Long` but `Long.MIN_VALUE`, negative included (`register*` throws `IllegalArgumentException` on `MIN`).
+Re-registering from `onTimer` via `context.timerService()` works in event and processing time. An `onTimer` throw, or a key that fails to deserialize at
 fire time, goes to `processing.exception.handler` (source topic `__timer`; the handler's record key is the decoded key,
-or the raw key bytes if decoding failed): CONTINUE writes its dead letters and drops the timer; FAIL (or a throwing
-handler, or a DLQ send that fails) stops the instance and keeps the timer, which fires again after restart on a
-persistent backend (`TwoTier` default / `RocksDB`; a `Heap` timer is lost on restart). Punctuator failures are routed
-the same way (`__punctuator`).
+or the raw key bytes if decoding failed, and its headers are the timer's — with raw key bytes, plus what the key
+serializer wrote, so a header-mode key stays decodable): CONTINUE writes its dead letters and drops the timer; FAIL (or a throwing
+handler, or a DLQ send that fails) stops the instance and keeps the timer, which fires again after restart — on every
+timer backend with its changelog on (default), and on `HYBRID` / `PERSISTENT` from local state with it off. Punctuator failures are routed
+the same way (`__punctuator`, no headers).
 Timer key serde: the key serde declared for the processor's key — upstream (`Consumed`/`Grouped`/`Repartitioned`) or
 downstream before any key change (`Repartitioned`/`Produced`) — else `default.key.serde`. With nothing declared on the
 records' path, an upstream DSL store's key serde counts (`groupBy(…).count(Materialized.withKeySerde(X)).toStream()` → X,
@@ -264,12 +333,107 @@ rethrown untouched).
   a later commit wins over one from an earlier commit, even when the earlier one was made later in time, and this holds
   after a restart too. So a cross-lane re-registration from a later commit than a fire waiting or running on `y`'s lane
   fires the timer once more, after it, and a cross-lane delete from a later commit than a waiting fire does NOT cancel
-  it (the fire runs in its own commit; a delete from the same commit or an earlier one cancels) — persistent backends;
-  `TimerBackend.Heap` has no commits and applies a cross-lane write when it happens: one fire, and a delete cancels. A
+  it (the fire runs in its own commit; a delete from the same commit or an earlier one cancels) — every timer backend;
+  only the TopologyTestDriver has no commits and applies a cross-lane write when it happens: one fire, and a delete cancels. A
   replay after a failure can place a cross-lane mutation in a different commit (one extra fire, one fewer, or a delete
   that cancels a fire it came after the first time, or the reverse). When order matters use the Flink-style pattern — forward a record
   re-keyed to `y` and arm the timer while processing it (one writer per key).
 
+### Timers and event time — the bounded timer cache
+
+Every timer backend holds at most `maxCachedTimers` timers **per time domain** in its timer cache, loaded in timestamp
+order (YAML `timer-backend.max-cached-timers`). Constructors lead with `changelogEnabled`:
+`TimerBackend.TwoTier(changelogEnabled, cacheHorizon, maxCachedTimers = 100_000)` (YAML `HYBRID`, the default) and
+`TimerBackend.RocksDB(changelogEnabled, maxCachedTimers)` (`PERSISTENT`) keep every timer in RocksDB;
+`TimerBackend.InMemory(changelogEnabled, cacheHorizon, maxCachedTimers)` (`MEMORY`, formerly `HEAP` — `type: HEAP` now
+fails the start) keeps every timer in memory with no bound on the total, loads no RocksDB, and replays the whole timer
+changelog at every start and in-place restart (slow start-up for many timers; with the changelog or state restoration
+off its timers are lost at every restart). `loadIntervalMs` / `load-interval-ms` no longer exist. Pick it in YAML
+(`stoatflow.timer-backend.type` + its keys) or in code: `StreamsConfig.builder(appId, servers).timerBackend(TimerBackend.InMemory())`
+— no Properties/Map key, so after `StreamsConfig.fromProperties(props)` chain `.timerBackend(...)`; under the runtime,
+`streamsConfigOverrides { timerBackend(...) }` replaces the whole YAML `timer-backend` block. From Java the
+`changelogEnabled` argument comes first: `new TimerBackend.InMemory(true, Duration.ofSeconds(30))`.
+
+- **Event time waits for an unloaded timer.** When more event-time timers are due than fit, the effective watermark
+  stops at the first one not yet loaded; the loaded ones fire, the next load, it moves on. Records that would move event
+  time past it wait in their partition buffers. No timer fires late; no window closes, no record is judged late and no
+  stream-time punctuator fires past an unfired timer — results equal an all-in-memory run.
+- `currentWatermarkMs()` follows the held watermark (in `process()` and `onTimer`).
+- Catch-up is stepwise (~`backlog / maxCachedTimers` steps); a slow `onTimer` holds every event-time effect in the app.
+  Advise raising `maxCachedTimers` when `stoatflow.watermark.timer.held` toggles often.
+- Processing-time timers have their own budget — a processing-time backlog never holds event time.
+- A **custom `WatermarkGenerator`** is never held record by record (no preview): only the watermark waits, so which late
+  records a window drops can differ from an all-in-memory run.
+- A timer registered for a time already loaded joins even a full cache (registrations within `cacheHorizon`; 1 s for
+  `RocksDB`). The `TopologyTestDriver` keeps every timer in memory and never holds the watermark.
+
+### Named timers (🆕, no KS equivalent)
+
+One timer per `(key, name)` across BOTH domains — the tool for a deadline that moves (session timeout, cart
+abandonment, debounce). Prefer it over keeping a `lastSeen` value in a store plus an exact
+`delete*Timer(key, oldTs)`.
+
+- `registerEventTimeTimer(key, name, ts)` / `registerProcessingTimeTimer(key, name, ts)` create or **replace** the
+  name's pending timer — at another time, or in the other domain (a processing-time registration moves an event-time
+  timer of that name). Same time + value again: no-op.
+- `deleteTimer(key, name)` — whatever the domain; also cancels a due fire waiting on the key's lane.
+  `deleteAllNamedTimers(key)` — every name of the key, both domains; unnamed timers stay.
+- `namedTimer(key, name): NamedTimer?` — `timeNotion()` (`TimeNotion.EVENT_TIME` / `PROCESSING_TIME`) and
+  `timestamp()` from Java; `null` when none.
+- In `onTimer`: `context.timerName()`. The fired timer is removed when `onTimer` returns normally (a failure: see the CONTINUE/FAIL rule below); inside that call
+  `namedTimer(key, name)` already returns `null` for it (through either `timerService()`) until the call registers it
+  again — `if (timers.namedTimer(key, name) == null) timers.registerEventTimeTimer(key, name, next)` re-arms.
+- Same rules as unnamed: domain gated by `declaredTimerTypes()` (`IllegalStateException`; deletes and the query are
+  not gated), non-null key, any timestamp but `Long.MIN_VALUE`. Name: non-empty, ≤ 255 UTF-8 bytes, else
+  `IllegalArgumentException`; a `null` name from Java throws `NullPointerException` (Kotlin's parameter
+  check — Kafka Streams' own APIs' convention for a `null` argument; Kafka Streams has no named timers). CONTINUE removes a failed named timer; FAIL keeps it (name and time) for the restart, as an
+  unnamed timer.
+- Named and unnamed timers coexist: same key + timestamp + domain → two timers, both fire.
+- **Key first:** with `K = String`, `registerEventTimeTimer("abandon", cartId, ts)` compiles and arms a timer for KEY
+  `"abandon"`. Check the argument order.
+- **Moves:** exact from the key's own lane (its `process()` / `onTimer`), also when the old deadline's fire is already
+  waiting. From another lane or a punctuator they follow the commit order above: within about one commit interval
+  around the old deadline the old deadline may fire too (the new one still fires later); two near-simultaneous moves
+  from different lanes are ordered by commit. A deadline moved long before it is due is replaced exactly. For
+  exactness in that window, forward a record re-keyed to the key and move its timers while processing it.
+
+```kotlin
+// one timeout per session: every event moves it, so only the latest deadline fires
+timers.registerEventTimeTimer(record.key, "timeout", session.lastActivity + SESSION_TIMEOUT_MS)
+
+override fun onTimer(timestamp: Long, key: String, context: TimerContext<String, Session>) {
+    val store = context.getStateStore<KeyValueStore<String, Session>>("sessions")
+    val session = store.get(key) ?: return // no "is this still the current deadline?" check needed
+    context.forward(key, session.complete())
+    store.put(key, null)
+}
+```
+
+
+### Timer headers (🆕)
+
+A timer carries the **headers of the record that armed it**: every registration, unnamed or named, reads the calling
+thread's record context at call time — the record in `process()`, the firing timer's own headers in `onTimer` (a re-arm
+keeps them), none in `init()` or a punctuator. `registerEventTimeTimer(key, ts, headers)`,
+`registerProcessingTimeTimer(key, ts, headers)` and the named `(key, name, ts, headers)` forms **upsert** theirs by key
+(each key they hold replaces the captured ones of that key, then they are appended) — a retry counter re-armed from
+`onTimer` stays one header. Nothing is mutated; the timer stores a copy. A timer keeps **one header per key** (the last
+of a repeated key): a header-mode serializer appends its schema id to the headers it is handed — a forward from
+`onTimer` hands it the timer's own — so a timer that forwards then re-arms stays bounded. The engine's `stoatflow.epoch`
+stamp is never stored, from the record or the passed headers. At fire, `TimerContext.headers()` / `FixedKeyTimerContext.headers()` (and a kept context's `headers()`) return
+a fresh mutable copy. **`forward(key, value)`** (with or without timestamp / child name) **and fixed-key
+`forward(value)` carry them** (they build their record on the call's record context); once a forward reaches a sink the
+producer makes that instance read-only (as for `process()`'s headers, and in KS) — change a copy for a later forward.
+`forward(record)` sends the record's own headers, as in `process()` and KS — a new `Record(k, v, ts)` has none; build it with `context.headers()`
+(or `record.withHeaders(context.headers())`) to carry them. Headers never reach the timer key serde: a key keeps
+one byte form, so deletes, `deleteTimer`, `deleteAllNamedTimers` and `namedTimer` from any context find the timer and
+take no headers; what the key serializer writes (Confluent header schema-id mode's key schema id) is stored with the
+timer and decodes its key at fire — so a **header-mode key serde can key timers**; a key serde whose bytes depend on
+header **contents** cannot (lane guard). A named re-arm at the same time is a no-op only with equal headers; a move takes
+the moving call's headers. Cost: headers are stored per timer (row, changelog) and in memory with each cached timer when
+≤ 1 KiB (larger ones are read back at fire); > 1 KiB WARNs (once a minute per processor); re-arming
+the same timer from every record writes it each time the records' headers differ (a per-record trace id). To opt out, arm from a context with no
+headers or forward to the timer node with `record.withHeaders(RecordHeaders())`.
 ## Processor wrapping (KIP-1112 `processor.wrapper.class`)
 
 One configured `ProcessorWrapper` decorates **every** node of the topology — DSL operators *and* Processor-API
@@ -301,15 +465,33 @@ name-matching wrapper compiles and matches nothing. Zero overhead when the key i
 `StreamsBuilder.scheduled(...)` → `KStream<K,V>` — periodically generates records without consuming from
 Kafka. Two overloads:
 
-- Interval: `scheduled(named, interval: Duration, type: PunctuationType, keySerde?, emitter)` —
-  `WALL_CLOCK_TIME` or `STREAM_TIME`; interval must be positive.
+- Interval: `scheduled(named?, interval: Duration, type: PunctuationType, keySerde?, options?, emitter)` —
+  `WALL_CLOCK_TIME` or `STREAM_TIME`; interval must be positive. Java: named and unnamed forms, each with and
+  without `ScheduledSourceOptions`.
 - Cron: `scheduled(named, cron: CronExpression, keySerde?, emitter)` — always wall-clock.
 
 `CronExpression` (factories `@JvmStatic`): `CronExpression.unix(...)` (5 fields, Sun=0), `.quartz(...)`
 (6–7 fields, Sun=1), `.spring(...)` (6 fields); unparseable → `IllegalArgumentException`.
 
-`ScheduledEmitter<K,V>` receives `ScheduledEmitterContext`: `forward(key, value[, timestamp])` /
-`forward(record)`, `getStateStore(name)` (**read-only** — `put`/`delete` throw `UnsupportedOperationException`
+**Fire times.** `WALL_CLOCK_TIME`: at start-up, then every interval. `STREAM_TIME`: at the first watermark, then
+each time the watermark passes a multiple of the interval — counted from event time 0, so the boundaries survive a
+restart. A jump over several intervals or cron occurrences (backlog, data gap, far-future timestamp, long pause)
+fires a source **once**, then it continues on its grid / at its next occurrence — not once per interval. "Start" is
+when processing begins — with HA, the promotion (a standby fires nothing). Every start fires an interval source again
+at once — in-place engine restarts too (a `REPLACE_THREAD` fault restart, a poison replay, a deleted pattern topic, an
+HA promotion). To wait for the first grid point instead (one interval after start, or the first multiple at or after
+the first watermark — at once when the first watermark is one), pass
+`options = ScheduledSourceOptions.start(ScheduledStart.NEXT_INTERVAL)` or set
+`stoatflow.dsl.scheduled-source-start: next-interval` (the default for sources that do not set it; `immediately` by
+default). A fire due while the previous run is still going waits for it, then fires once (late, coalesced). A
+`STREAM_TIME` source fires at the first watermark even when it is negative (small test event times); a Kafka sink sends
+a negative timestamp as `null`, so the broker stamps the wall clock (A2.16). A `STREAM_TIME` source needs a
+watermark: refused under `timestampCoordinationMode = DISABLED`, beside a `noWatermarks()` source, or in a topology
+that reads no Kafka topic — at start, and by the TopologyTestDriver when it is built.
+
+`ScheduledEmitter<K,V>` receives `ScheduledEmitterContext`: `forward(key, value[, timestamp])` (no timestamp ⇒ the
+fire time: the watermark that fired a `STREAM_TIME` source, the wall-clock time otherwise) /
+`forward(record)` (a timestamp of `Long.MIN_VALUE` throws `IllegalArgumentException`), `getStateStore(name)` (**read-only** — `put`/`delete` throw `UnsupportedOperationException`
 for every store family: plain KV/window/session as well as timestamped, versioned and headers-aware, incl.
 the timestamped store a DSL `Materialized` aggregation produces. The view keeps the store's declared type,
 so a `getStateStore<TimestampedKeyValueStore<..>>` cast still succeeds), `currentWallClockTime()` and
@@ -320,9 +502,14 @@ so a `getStateStore<TimestampedKeyValueStore<..>>` cast still succeeds), `curren
 builder.scheduled<String, String>(
     interval = Duration.ofSeconds(30),
     type = PunctuationType.WALL_CLOCK_TIME,
+    keySerde = Serdes.String(),
     emitter = { ctx -> ctx.forward("heartbeat", "alive-${ctx.currentWallClockTime()}") },
 ).to("heartbeats", Produced.with(Serdes.String(), Serdes.String()))
 ```
+
+Each forwarded (non-null) key is serialized with the source's key serde (`keySerde`, else `default.key.serde`) to pick
+its lane — so the serde must serialize the keys you forward; a `String` key with neither set fails the fire, in the
+`TopologyTestDriver` as in production.
 
 Auto-named `scheduled-source-0`, `-1`, … `STREAM_TIME` is data-driven (won't fire without records);
 cron/`WALL_CLOCK_TIME` fire independent of throughput. Emitted records participate in the exactly-once

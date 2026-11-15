@@ -5,7 +5,7 @@
 
 **StoatFlow is a JVM stream-processing library** that pairs the Kafka Streams DSL with Flink-style
 commit-barrier reliability, powered by Project Loom virtual threads. It is **source-compatible with
-Kafka Streams 4.3 via an import swap** — but it is **not** Kafka Streams, and it is a **commercial,
+Kafka Streams 4.4 via an import swap** — but it is **not** Kafka Streams, and it is a **commercial,
 closed-source** product distributed only from the private repository `maven.stoatflow.io` (never Maven
 Central).
 
@@ -48,17 +48,18 @@ facts explain the rules above:
   reason `replicas: N` is forbidden.
 - **Key-affinity lanes** are StoatFlow's unit of parallelism — *virtual* partitions, **not** Kafka
   partitions. Records with the same key always route to the same lane (consistent hashing) → per-key
-  ordering with high parallelism across virtual threads. Lane count is configured at startup
-  (`withNumberOfLanes`; recommended ≈ CPU cores × 4), independent of the topic's partition count.
+  ordering with parallelism across keys. Lane count is set at startup — default `max(2, CPU cores / 4)` per
+  sub-topology on `PLATFORM` threads, `stoatflow.lanes.count` or `withNumberOfLanes` to change it — independent
+  of the topic's partition count. Many lanes on `VIRTUAL` threads (`lanes.thread-type`) suit blocking I/O.
 - **Commit barriers** flow through the topology as a Flink-style *consistent cut* linked to a Kafka
   transaction → end-to-end **exactly-once** across state and offsets.
-- **Global state.** All state is reachable from any lane/virtual thread (no partition-scoped
+- **Global state.** All state is reachable from any lane (no partition-scoped
   isolation). State is durable via changelog topics (Kafka Streams style), on RocksDB or in-memory
   stores.
 
 ## Compatibility statement
 
-**Targets StoatFlow 1.0.0-rc.4 (Kafka Streams 4.3 API surface).** This is a pre-GA release —
+**Targets StoatFlow 1.0.0-rc.5 (Kafka Streams 4.4 API surface).** This is a pre-GA release —
 APIs may still change. If your StoatFlow version differs, prefer the matching tagged release of this
 pack. The divergence register (`KSC-NN` / `D-N`) is the authoritative list of where StoatFlow
 intentionally differs from Kafka Streams; the `stoatflow-port-from-ks` skill carries it in full.

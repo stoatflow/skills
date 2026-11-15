@@ -41,7 +41,7 @@ All run **inside one quiesce window with the KS app cleanly stopped**; each is r
 | `plan -c migration.yaml` | Verifies everything, **writes nothing**. Discovers `{ks-app}-*-changelog` topics and cross-checks them against the config; asserts the KS group is EMPTY and repartition lag is 0; warns loudly under ALO (clean shutdown mandatory); runs structural type heuristics; resolves source-KTable paths; asserts target partition counts; checks `message.timestamp.type=CreateTime` and headers-vs-declared; captures the consistency point. |
 | `translate -c migration.yaml [--force]` | Creates the target changelog topics with StoatFlow's exact configs and seeds them (`read_committed`, earliest→LSO); seeds the `{sfName}-emitfrontier` companions for stores marked `emitFrontier: true`. Re-run needs an empty target or `--force` (delete + recreate; no partial resume). |
 | `seed-offsets -c migration.yaml` | Copies the KS committed offsets for `inputTopics` into the (empty) StoatFlow consumer group. Run **before** the first StoatFlow start. Recommend `AutoOffsetReset.none()` on migrated sources so a partial seed fails loud. |
-| `verify -c migration.yaml` | Per store: count + order-independent checksum of the seeded topic vs a re-read through the same translation, spot byte-comparisons, partition-count assert, emit-frontier check. It proves faithful *seeding*, not classification correctness — so a **post-start IQ spot-check is a required runbook gate**, not optional. |
+| `verify -c migration.yaml` | Per store: count + order-independent checksum of the seeded topic vs a re-read through the same translation, spot byte-comparisons, partition-count assert, emit-frontier check. It proves faithful *seeding*, not classification correctness — so a **post-start IQ spot-check is a required runbook gate**, not optional. It **refuses** (exits 1, `ABORTED: …` naming the topic, partition, offset and version) when a target changelog record carries a StoatFlow changelog format version (`__stoatflow.v` header) newer than the tool knows — it cannot check what it cannot decode; use a tool version that matches the application — or a malformed one (not a single byte, or `0`), which no tool version reads: something other than StoatFlow wrote that header. |
 
 ## The config (`migration.yaml`)
 
@@ -72,6 +72,8 @@ stores:
     extraTopicConfigs: {}             # optional per-store topic-config overrides
     recordHeaders: false              # true iff the store is headers-aware (KIP-1271) — carries native headers
     emitFrontier: true                # OnWindowClose aggregations only: seed {sfName}-emitfrontier
+    retainDuplicates: false           # window-timestamped only: a timestamped / headers-aware store built with
+                                      #   retainDuplicates = true (a plain one is window-duplicates)
     sourceTopic: null                 # for source-KTable stores: the source topic (path resolution)
 ```
 
@@ -86,7 +88,7 @@ the KS auto-generated name.
 ## Classifying your stores (KS DSL operation → `type`)
 
 Legal `type` values: `kv`, `kv-timestamped`, `window`, `window-timestamped`, `window-duplicates`,
-`session`, `versioned`, `fk-subscription`, `outer-join`.
+`join-window`, `session`, `versioned`, `fk-subscription`, `outer-join`.
 
 | KS DSL operation / store | `type` |
 |---|---|
@@ -95,11 +97,21 @@ Legal `type` values: `kv`, `kv-timestamped`, `window`, `window-timestamped`, `wi
 | Foreign-key-join or table-table join **result** store | `kv-timestamped` |
 | `windowedBy(TimeWindows/SlidingWindows).aggregate` | `window-timestamped` |
 | `windowedBy(SessionWindows).aggregate` | `session` |
-| Stream-stream join window stores | `window-duplicates` |
+| Stream-stream join window stores (`-this-join-store`, `-other-join-store`, `KSTREAM-JOINTHIS-…`) | `join-window` — `window-duplicates` is refused for these names, and for a StoatFlow `sfName` ending `-left-store` / `-right-store`. A buffer named by a store supplier keeps that name on both sides, which the tool cannot recognise: declare it `join-window` yourself (as `window-duplicates` its values would decode wrongly after cutover). `recordHeaders: true` **only** if the KS app ran `dsl.store.format=headers` or in-memory join stores; **never** for the default PLAIN format (its buffers dropped the headers locally, while the 4.3+ changelog still carries them — migrating them would decode the first post-cutover match against the input's schema id). `plan` WARNs on every `join-window` with `recordHeaders: true`, and notes one left at `false` whose changelog carries headers (right for PLAIN; a HEADERS or in-memory app with header-mode join serdes needs `true`) |
+| Processor API duplicate-retaining window store (plain) | `window-duplicates` |
+| Processor API duplicate-retaining **timestamped or headers-aware** window store (`Stores.persistentTimestampedWindowStore[WithHeaders](…, true)`) | `window-timestamped` + `retainDuplicates: true` (+ `recordHeaders: true` for headers) — as `window-duplicates` its values would lose their timestamp; without the flag `plan` reads the non-zero seqnums as a misclassified store |
 | LEFT/OUTER stream-stream **shared** (outer) store | `outer-join` |
 | Foreign-key-join **subscription** store | `fk-subscription` |
 | Versioned KTable (KIP-889) | `versioned` *(experimental — see the tombstone note below)* |
 | Any of the above that is **headers-aware** (KIP-1271) | family type **+ `recordHeaders: true`** |
+
+**Carried headers (`recordHeaders: true`).** The tool copies the KS changelog's native record headers minus: Kafka
+Streams' internal **trailing** consistency pair (`v` = `0x00`, then `c` — KS appends it last, only with its internal
+IQ consistency setting on; a `v` or `c` anywhere else is the application's and stays), StoatFlow's reserved names
+(`__stoatflow.v`, `__stoatflow.v.*`) and its engine stamp `stoatflow.epoch`. A StoatFlow headers-aware store never
+holds those (KSC-149), so the migrated store's headers match what it would have written itself. A `join-window` store
+keeps them inside each value (its serde-headers block), not on the record; there the tool drops only the trailing
+consistency pair, since a StoatFlow join buffer keeps every header its serializers write.
 
 > **Versioned stores: deletes are re-encoded, and must be.** Kafka Streams logs `delete(key, ts)` as a
 > Kafka **null**. StoatFlow reserves a changelog null for its retention sweep's *reclamation* tombstones

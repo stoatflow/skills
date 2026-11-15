@@ -9,7 +9,7 @@ license: Apache-2.0
 Read `references/stoatflow-primer.md` first — the identity rules (import root `io.stoatflow.core.*`,
 `kafka-clients` only, single-instance, `EXACTLY_ONCE` default) apply to every line you write.
 
-The DSL is **Kafka Streams 4.3-shaped** under `io.stoatflow.core.*`: `StreamsBuilder`, `KStream`, `KTable`,
+The DSL is **Kafka Streams 4.4-shaped** under `io.stoatflow.core.*`: `StreamsBuilder`, `KStream`, `KTable`,
 `GlobalKTable`, `Materialized`, `Stores`, `Consumed`/`Produced`/`Grouped`, the `Processor` API — same names,
 same shapes. Write it as you'd write Kafka Streams, then apply the StoatFlow-specific rules below.
 
@@ -31,7 +31,8 @@ StoatFlowRuntime.fromConfig(topologyBuilder = { buildTopology(it) }).start()
 Sources: `builder.stream(topic|collection|Pattern, Consumed?)` → `KStream` (a `Pattern` subscribes every matching topic and picks new ones up within `metadata.max.age.ms`, 30 s default; N patterns OR-combine; a topic two patterns accept is rejected at assignment; StoatFlow does NOT exclude its own changelog/HA/DLQ topics — scope the pattern); `builder.table(...)` → `KTable`
 (always materialized, store `{topic}-store`); `builder.globalTable(...)` → `GlobalKTable`;
 `builder.scheduled(...)` → `KStream` (🆕 no KS equivalent — see `references/processor-api.md`). Sinks:
-`stream.to(topic|TopicNameExtractor, Produced?)`, `forEach`, `print`.
+`stream.to(topic|TopicNameExtractor, Produced?)`, `forEach`, `print`. A static sink topic must exist before the
+start: `start()` refuses with `MissingOutputTopicException` naming it (KSC-148) — StoatFlow never creates it.
 
 ## The one rule that isn't Kafka Streams: fan-out by REUSING the reference
 
@@ -55,13 +56,13 @@ stream.mapValues { v -> v.length }.to("output-b")          // branch 2
   (`count`/`reduce`/`aggregate`, stream and table), with the `Consumed`/`Produced`/`Grouped`/`Materialized`
   config objects.
 - **Windowing + joins** → `references/windowing-joins.md`: `TimeWindows`/`SlidingWindows`/`SessionWindows`,
-  `emitStrategy`, `suppress`, and stream-stream / stream-table / table-table / **foreign-key** / cogroup
-  joins.
+  `emitStrategy`, `suppress`, stream-stream / stream-table / table-table / **foreign-key** / cogroup
+  joins, and watermark alignment (`withWatermarkAlignment` — a dispatch hold; idleness required).
 - **Processor API + scheduled sources** → `references/processor-api.md`: `process`/`processValues`,
   `Processor`/`FixedKeyProcessor`, `ProcessorContext`, punctuators, **timers** (🆕 Flink-style
   `onTimer`), and `builder.scheduled()`/`CronExpression`.
 - **Serdes + state stores + DLQ** → `references/serdes-state-stores.md`: `Serdes`/`Serde`, custom + Avro,
-  the `Stores` factory + `Materialized`, interactive queries, and the three exception handlers (deser /
+  the `Stores` factory + `Materialized`, interactive queries (`store()` and IQv2 `query()`), and the three exception handlers (deser /
   processing / production) + DLQ.
 
 ## StoatFlow-specific rules (get these right)
@@ -94,8 +95,19 @@ stream.mapValues { v -> v.length }.to("output-b")          // branch 2
   `topology.processor-api-key-affinity: presumed` to restore the boundary everywhere; or stop keying the
   store by the post-re-key key. An **injective** (1:1) re-key is safe with no boundary — StoatFlow lanes
   by the *old* key — and a node that declares a timer keeps its boundary regardless.
-- **Scale with lanes, not partitions/replicas** — parallelism is `stoatflow.lanes.count` (≈ CPU × 4), a
-  virtual-partition count independent of the topic's Kafka partitions. Never suggest `replicas: N`.
+- **Every `Long` but `Long.MIN_VALUE` is an event time** (Flink is the reference; Kafka Streams refuses
+  negatives). Negative times flow through windows, joins, timers and sinks — a sink writes a negative-time record
+  without a timestamp, so the producer or broker stamps the wall clock (`stoatflow.sink.records.negative.timestamp.total`).
+  `Long.MIN_VALUE` means **no event time**: a source record carrying it from an extractor/assigner, or with Kafka's
+  `-1` and no extractor/assigner, is skipped and counted (`stoatflow.dropped.records.total{reason=no_event_time}`);
+  your code passing it as a time (`Record`, `forward(k, v, ts)`, a timer) throws `IllegalArgumentException`. Windows
+  near 0 are floor-aligned, unlike Kafka Streams (`references/windowing-joins.md`). To refuse negative timestamps
+  as Kafka Streams does, configure `FailOnInvalidTimestamp` or `LogAndSkipOnInvalidTimestamp`
+  (`io.stoatflow.core.processor`) as `default.timestamp.extractor` or via `Consumed.withTimestampExtractor(...)`.
+- **Scale with lanes, not partitions/replicas** — parallelism is `stoatflow.lanes.count` (default
+  `max(2, CPU cores / 4)` per sub-topology, on `PLATFORM` threads; `withNumberOfLanes(n)` for one sub-topology), a
+  virtual-partition count independent of the topic's Kafka partitions. Blocking I/O in a processor: many lanes
+  with `lanes.thread-type: VIRTUAL`. Never suggest `replicas: N`.
 - **Handle `null` values (tombstones)** — mappers/predicates/foreach receive `null` values on KTable
   changelog streams; StoatFlow does not filter them. A serde must round-trip `null` cleanly.
 - **Aggregators must be pure** — build and return a **new** aggregate; never mutate the incoming one in

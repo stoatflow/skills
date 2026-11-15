@@ -57,11 +57,23 @@ driver.close()
 - **Time:** `advanceWatermark(long)` (event time — fires ET timers, closes windows, flushes suppress),
   `advanceWallClockTime(Duration)` (processing time — fires WC punctuators/scheduled sources, then
   commits; it is also what `currentSystemTimeMs()` / `currentProcessingTime()` return in your code), `commitBarrier()` (commit the epoch + flush barrier-gated suppress), `triggerScheduledSource(name)`.
+  A `WALL_CLOCK_TIME` scheduled source fires on the **first** `advanceWallClockTime` (it is due at start —
+  unlike a WC punctuator, which waits one interval), a `STREAM_TIME` one at the first stream-time advance — the
+  first `pipeInput` under the default `test.driver.commit-per-pipe`, else the first `advanceWatermark` — unless
+  it starts at `ScheduledStart.NEXT_INTERVAL` (per source, or `dsl.scheduled-source-start`). An advance spanning
+  many intervals or cron occurrences fires a source **once**, not once per interval. While `pause()`d, advances
+  fire nothing; `unpause()` fires what they skipped, once per clock.
 - **State:** `getKeyValueStore(name)` (unwraps timestamped and headers-aware → raw `V`), `getWindowStore`,
   `getSessionStore`, `getTimestampedKeyValueStore`, `getVersionedKeyValueStore`, the `*WithHeaders`
   variants, generic `getStateStore(name)`, `getAllStateStores()`, `producedTopicNames()`.
+  The getters read the latest writes whatever `interactive-query-isolation-level` says; call
+  `readOnly(IsolationLevel.READ_COMMITTED)` on the returned store to read what the last commit (`commitBarrier()`,
+  or each `pipeInput` under the default per-pipe commit) made durable. Every store commits, window and session stores
+  included, so their retention expires old windows and sessions as in production. Versioned stores run in memory in the driver,
+  so `READ_COMMITTED` on one reads live (with a WARN) — a test cannot show it for a versioned store.
 - `TestRecord(key, value, headers, timestamp)` — KS positional order; the timestamp is unset by default, and
-  `pipeInput(record)` then takes the input topic's current time (KS parity).
+  `pipeInput(record)` then takes the input topic's current time (KS parity). Any timestamp but `Long.MIN_VALUE` is
+  accepted, negative included (KS's `TestRecord` rejects negatives); `MIN` throws `IllegalArgumentException`.
 
 `TopologyTestDriver` is **not thread-safe** — one instance per test (`@BeforeEach` create, `@AfterEach`
 close).
@@ -83,8 +95,13 @@ close).
 - **Headers-aware stores:** a write through the plain accessors (`put`, `compute`, `merge`) stores empty headers,
   as in KS; `test.driver.keep-existing-headers=true` (test-harness only) keeps an existing entry's headers instead
   (not on a duplicate-retaining window store, where a `put` appends — the driver WARNs).
-- **`advanceWatermark`** is lenient by default (a backward request is a silent no-op); strict (forward-only
-  throw) under manual mode.
+- **`advanceWatermark`** is lenient by default (a backward request leaves the watermark where it is, and fires only
+  the event-time timers already due); strict (forward-only throw) under manual mode.
+- **Negative event times are data** (KSC-138), as in production: windows near 0 are floor-aligned, so a KS-shaped
+  test with timestamps below a window size sees extra windows starting before 0 (and one sliding window per record
+  where KS combines them into `[0, D]`). A record piped with timestamp `-1` on a source with no extractor/assigner is
+  Kafka's "no timestamp": skipped and counted, no output. A negative-time record reaching a sink is stamped with the
+  driver's wall clock. An extractor's exception fails the `pipeInput` (so `FailOnInvalidTimestamp` fails the test).
 
 ## TTD vs production — the caveat that bites
 
@@ -134,10 +151,20 @@ The TTD is a **fidelity approximation**, not the engine:
   connects a writable store fails the driver. That is deliberate (it is silent data loss at runtime);
   the remedies are `repartition()`, `topology.processor-api-key-affinity: presumed`, or re-keying the
   store. Never tell a user a `topology.validation.*` key cannot fail their build.
-- **The driver inherits the builder's topology-build settings.** `TopologyTestDriver.fromBuilder(builder)`
-  with no explicit config picks up `subTopologySplit` / `processorApiKeyAffinity` from the
-  `StreamsBuilder(TopologyConfig(cfg))` it was given, so the driver compiles the shape production runs.
-  Pass a config explicitly and that config wins.
+- **The output-topic check is not run by the driver.** `StoatFlow.start()` refuses when a sink or dead-letter topic
+  is missing (`MissingOutputTopicException`, KSC-148); the `TopologyTestDriver` never starts, so a driver test
+  passes against a topic name the broker does not have. A broker test that starts the app must create them.
+- **The driver inherits the builder's topology-build settings.** Every construction path given no config —
+  `TopologyTestDriver.fromBuilder(builder)`, `fromTopology(topology)`, the KS-shaped `TopologyTestDriver(topology)`
+  and `(topology, Instant)`, and the `Properties` constructors for a setting the `Properties` do not name — picks up
+  `subTopologySplit` / `processorApiKeyAffinity` from the `StreamsBuilder(TopologyConfig(cfg))` the topology was built
+  with, so the driver compiles the shape production runs. Pass a config (or name the setting) and that wins. These are the **built** settings: an earlier driver or
+  application compiled under another config does not change what a later config-less driver compiles.
+- **Several drivers may share one builder or `Topology`** — a shared fixture, two drivers compared in one
+  test, a driver over a running application's builder: each builds its own processors and state stores, as
+  in Kafka Streams. Two things stay shared because the topology holds them as user objects: a scheduled
+  source's emitter (every run invokes the same object — keep it stateless, or give each driver its own
+  builder) and a `Printed.toFile` stream.
 
 ## Config-driven tests (StoatFlowTestDriver)
 

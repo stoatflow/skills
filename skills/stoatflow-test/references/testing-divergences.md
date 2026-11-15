@@ -78,6 +78,12 @@ input.pipeInput("k", "a", windowStart)                 // in-window
 input.pipeInput("k", "b", windowStart + size + grace)  // past close → the window's result flushes here
 ```
 
+**Eager suppress buffers:** the driver is one lane, so `maxRecords(n)` / `maxBytes(n)` with `emitEarlyWhenFull()`
+gives it the whole bound and it emits its oldest record on overflow (a single KS task). In the application each writer —
+each lane of the suppress's sub-topology, plus its punctuation lane when an upstream operator emits from there — holds
+bound ÷ writer count (KSC-154), so a small bound emits early more often there: assert final results, not the number of
+early emissions.
+
 ## The unified opt-out: `test.driver.commit-per-pipe`
 
 A test-harness-only boolean (default `true`; the engine never reads it). It governs **both** the KSC-63
@@ -104,11 +110,25 @@ The topic's time is read from the driver clock when the topic is created and the
 (auto-advance, `withTimestamp`, `advanceTime`, `reset()`); a later `advanceWallClockTime` does not move it (also KS). Pin `initialWallClockTime` on the driver for deterministic
 timestamps.
 
-## One driver per builder
+## KSC-138 — negative event times are data
 
-The processors belong to the `StreamsBuilder` / `Topology`, and every run over it reuses them. Build a fresh builder
-per driver: two drivers open over one builder — or a driver over the builder of a running application — share
-processor instances and wiring and interfere (tracked as a fix).
+The driver applies the engine's event-time rules: every `Long` but `Long.MIN_VALUE` is a time.
+
+- **Windows near 0 follow Flink, not KS.** Windows are floor-aligned with no clamp at 0, so a KS-shaped test with
+  timestamps below a window size sees more windows than on KS: a record at 5 s in 60 s windows advancing by 10 s
+  joins six windows (starting −50 s … 0), KS one (`[0, 60 s)`); a sliding record at `0 ≤ t < D` gets its own window
+  `[t − D, t]`, where KS combines them into `[0, D]`. Results above those times are identical — shift the test's
+  timestamps above the window size, or assert the extra windows.
+- **Negative timestamps pipe** (KS's `TestRecord` rejects them); `Long.MIN_VALUE` throws `IllegalArgumentException`.
+- **No timestamp is skipped.** A record piped with `-1` (Kafka's "no timestamp") on a source with no extractor or
+  assigner, or one whose extractor returns `Long.MIN_VALUE` (`LogAndSkipOnInvalidTimestamp` on a negative timestamp),
+  produces nothing and does not move stream time — counted as `dropped.records{reason=no_event_time}`, as in production.
+- **An extractor's exception fails the pipe**, as it fails the application: `FailOnInvalidTimestamp` throws out of
+  `pipeInput` on a negative timestamp. Extractors get the partition time the driver keeps per topic, and the piped
+  record — its topic, headers, key bytes and timestamp — as in production; its partition and offset are always 0 (KS's
+  driver counts offsets per topic).
+- **A sink stamps a negative event time with the driver's wall clock** (production writes no timestamp and the
+  producer or broker stamps the wall clock), and counts it in `stoatflow.sink.records.negative.timestamp.total`.
 
 ## Wall clock in user code (KSC-133)
 
@@ -119,6 +139,20 @@ return the **driver wall clock** — the one `advanceWallClockTime` moves — as
 timer registered at `currentProcessingTime() + d` fires on `advanceWallClockTime(d)`. In production both read the
 system clock. Never call `System.currentTimeMillis()` directly in a processor you want to test this way.
 
+## `Properties` without `application.id` (KSC-155)
+
+`TopologyTestDriver(topology, props)` and `(topology, props, Instant)` fill in a missing `application.id` and
+`bootstrap.servers` on a copy of `props` (your object is unchanged), as Kafka Streams' driver does — so a ported test
+that passes only its serdes, or an empty `Properties`, builds as it did on Kafka Streams. The default id is `test-app`,
+the driver's default on every construction path; Kafka Streams' driver picks a random
+`dummy-topology-test-driver-app-id-<n>` to keep drivers' state directories apart, which StoatFlow's driver gets from a
+temporary directory per instance. The id is what `context.applicationId()` reports and what app-scoped internal names
+(and a mock schema registry's subjects) start with — set `application.id` when a test needs its own, and in tests that
+share a `mock://` scope without dropping it, or their subjects meet. A `StreamsConfig` built from `Properties` still
+requires one, as in Kafka Streams. A split setting (`topology.sub-topology-split`, `topology.processor-api-key-affinity`)
+the `Properties` do not name is the one the topology was built with (`TopologyConfig`), as for a constructor given no
+config; a `StreamsConfig` passed to the driver sets both itself.
+
 ## The production-fidelity caveat (retained divergence)
 
 TTD stream-time = `max(observed event-time)` with **no lag**. Production uses `BoundedOutOfOrderness(10s)`
@@ -126,6 +160,8 @@ TTD stream-time = `max(observed event-time)` with **no lag**. Production uses `B
 **later** in production. To make production match the TTD, configure `forMonotonousTimestamps()` /
 `maxOutOfOrderness = 0` and account for per-partition idleness. The TTD has no partition buffers or head
 ordering either: a record stamped in the future is processed as soon as it is piped, while production holds it behind
-older records (event time follows the other partitions meanwhile). Anything depending on changelog,
+older records (event time follows the other partitions meanwhile). For the same reason the TTD does **not model
+watermark alignment** — `withWatermarkAlignment(...)` holds nothing in a test, so a hold that keeps production waiting
+never shows; the two alignment build rules (`alignment-idleness-off`, `alignment-mixed-watermark-bounds`) do run. Anything depending on changelog,
 restoration, EOS transactions, or cross-lane ordering is invisible to the TTD — cover it with a real
 broker (`integration-testing.md`).

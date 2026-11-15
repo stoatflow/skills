@@ -7,15 +7,15 @@ Read endpoints are `GET` (wrong method → 405; pre-startup → 503). **Expose o
 | Endpoint | Method | Purpose |
 |---|---|---|
 | `/health/live` | GET | Liveness — process healthy enough to stay alive? (200 UP / 503 DOWN). Flips DOWN if the commit pipeline freezes past `stoatflow.commit-stall.threshold-ms` (45 s). License never fails liveness. |
-| `/health/ready` | GET | Readiness — ready to process? 503 throughout restoration + the ~5-min license `PENDING` window. |
-| `/info` | GET | App id and effective lane count (`app.lanes`), JVM/Kafka info, uptime, state, registered endpoints. |
+| `/health/ready` | GET | Readiness — ready to process? 503 throughout restoration. The ~5-min license `PENDING` window after start is UP (the pod takes traffic). License `EXPIRED`/`REVOKED`/`INVALID`/no key → 503; the instance-limit state is `INVALID` with `reason: instance_limit` while the pod keeps processing. |
+| `/info` | GET | App id, effective lane count (`app.lanes`) and record-lane thread type (`app.laneThreadType`; under DIRECT dispatch, `topology.dispatchMode`, no record lanes run), JVM/Kafka info, uptime, state, registered endpoints. |
 | `/config` | GET | Merged effective config, secrets masked (YAML; JSON via `Accept`). |
 | `/topology` `/topology/ks` `/topology/compiled` | GET | Native view · Kafka-Streams-compatible `describe()` view · compiled internal view. `/topology/ks` (JSON with `Accept: application/json`) is the pull equivalent of KS 4.4's KIP-1331 topology-description push — StoatFlow is a classic consumer group, so `describeStreamsGroups` never lists it (KSC-113). |
 | `/state` | GET | Lifecycle state + transition history. |
-| `/consumer` | GET | Consumer-group metadata, subscription, last commit time, per-partition buffer + pause state (`paused` for any reason: full buffer, watermark alignment, the application pause, start-up restoration). |
+| `/consumer` | GET | Consumer-group metadata, subscription, last commit time, per-partition buffer + pause state (`paused` for any reason: full buffer, the application pause, start-up restoration; watermark alignment never pauses). |
 | `/offsets` | GET | Per-partition committed source offsets + lag, and committed changelog offsets per store. |
-| `/watermarks` | GET | Global + per-partition event-time watermarks, idle flags, last event times. A partition whose next record is stamped in the future and held behind older records also shows `previewWatermarkMs` (what it counts with in the global watermark, while that is above its own) and `headHeldSinceMs`. |
-| `/license` | GET | Runtime license-validation state. |
+| `/watermarks` | GET | Global + per-partition event-time watermarks, idle flags, last event times. A partition whose next record is stamped in the future and held behind older records also shows `previewWatermarkMs` (what it counts with in the global watermark, while that is above its own) and `headHeldSinceMs`. With watermark alignment: `alignmentGroup`, `alignmentHeld`, `driftFromGroupMinMs` per partition, `alignmentGroupMins`, and `alignmentBinding` — `{group, partition, emptyLaggards, sinceMs}` of the hold keeping the whole application waiting, or `null` (also while a pause or backpressure, not the hold, is what stops dispatch; `sinceMs` survives that). A partition that waited in a hold with records buffered does not count that wait as silence: its `lastEventTimeMs` moves forward by it afterwards. Bounded timer cache (every timer backend): `rawGlobalMs`/`rawGlobalIso` (event time without the timer hold — ahead of `globalMs` only while it binds), `timerFrontierMs` (the first stored event-time timer not yet loaded, `null` when all are; `globalMs` never passes it; it moves back when a timer registers below it, `globalMs` never does), `timerHeld`/`timerHeldSinceMs`, and per partition `timerFrontierHeld` with `timerFrontierHeadMs` (the waiting record's time) and `timerFrontierContributionMs` (what it counts with — capped at the frontier, so it moves back with it). |
+| `/license` | GET | Runtime license-validation state: status, tier, expiry, `machinesUsed` (instances **registered** against the license — briefly includes ones that just stopped) vs `machinesAllowed` (instances it **covers**). |
 | `/pause` `/unpause` | POST | Pause (→ `DRAINING` → `PAUSED`, readiness DOWN, no rebalance) / resume (→ `RUNNING`). Wrong state → 400. |
 | `/ha/status` | GET | HA cluster view (only when `ha.mode != off`; else 404). |
 | `/ha/switch` `/ha/promote` `/ha/demote` | POST | Role commands (202 + `commandOffset`). |
@@ -63,7 +63,7 @@ epoch flush timer — StoatFlow commits every store at every barrier, so the rat
 
 Main metric families (level `info`): throughput/latency (`stoatflow.lane.records.processed.total`,
 `stoatflow.lane.process.latency`, `stoatflow.e2e.latency`), barrier commits
-(`stoatflow.barrier.{completed,failed,abandoned}.total` — abandoned = deliberately not committed, `reason` `pre_assignment`/`poison_abort`/`abort_teardown`/`not_broadcast`, not a failure; `failed`'s `error_type` `fatal_error` = an `Error` (`TODO()`, `AssertionError`) thrown by user serde/store code during a commit — `stoatflow.barrier.commit.latency`,
+(`stoatflow.barrier.{completed,failed,abandoned}.total` — abandoned = deliberately not committed, `reason` `pre_assignment`/`poison_abort`/`abort_teardown`/`not_broadcast`, not a failure; `failed`'s `error_type` `fatal_error` = an `Error` (`TODO()`, `AssertionError`) thrown by user serde/store code during a commit; `unhandled_send_failure` = an at-least-once send that failed with no production handler to decide it (a changelog record, a dead letter, an output under the default handler without a `dlqTopic`) or fatally, and `poison_epoch` = a handler's `FAIL` for an asynchronous send failure (a handler that throws or returns `null` included) — both stop the commit before it writes anything, offsets held, so the restart sends again (a record too large for its topic recurs on every start until `max.message.bytes` is raised) — `stoatflow.barrier.commit.latency`,
 `stoatflow.barrier.trigger.total{TIME,RECORD_COUNT,MEMORY_PRESSURE,CACHE_PRESSURE}`), watermarks
 (`stoatflow.watermark.{current,lag.ms,late.records.total,preview.partitions}`), changelog/restoration
 (`stoatflow.restoration.{in.progress,records.restored.total}`; `stoatflow.restoration.remaining.records{store_name}` — records a store still has to restore, 0 once done), consumer/producer
@@ -73,7 +73,30 @@ restart; `ha_source_shrink` = the HA detector's confirmed shrink);
 `stoatflow.source.pattern.matched.topics{source}` — topics a pattern source
 currently matches, `0` = matches nothing yet), client state (`stoatflow.client.state` — ordinal, `== 4` = RUNNING =
 healthy-and-processing), HA (`stoatflow.ha.*`, only when on), and license
-(`stoatflow.license.valid{tier}`). JVM/Kafka-client metrics via `bind-jvm-metrics` (default true).
+(`stoatflow.license.valid{tier}`; `…validations_total{result}`, `…heartbeats_total{result}`, `…pings_total{result}`
+— see below). JVM/Kafka-client metrics via `bind-jvm-metrics` (default true).
+
+**License: instances, limit, expiry.**
+- One `application.id` + environment is one licensed instance; replicas and an HA pair count once. A running
+  instance stays counted through a heartbeat ping (`stoatflow.license.pings_total{result=success|machine_lost|network_failure|other}`
+  — a failed ping never stops anything); a stopped one frees its slot within about the license's heartbeat window.
+  Renaming an environment registers a new instance.
+- **Instance limit.** A new instance whose license is full is refused at its deferred validation (~5 min after
+  start: "StoatFlow instance allowance exhausted…") and shuts down. A *running* instance that loses its
+  registration and cannot register again keeps processing, reports `INVALID` + `reason: instance_limit` (readiness
+  503, liveness UP), retries every heartbeat and recovers once a slot frees. Alert:
+  `increase(stoatflow_license_validations_total{result="instance_limit"}[1h]) > 0`.
+- **Over-registered license** (its limit was lowered below the registered instances): every instance logs a
+  warning and keeps running, readiness UP, liveness detail `licenseOverRegistered`, `result="over_registered"`.
+  The fix is the vendor's (contact your StoatFlow administrator).
+- `validations_total` / `heartbeats_total` `result` is a fixed set: `success`, `invalid`, `expired`, `revoked`,
+  `network_failure`, `offline_grace_exhausted`, `environment_required`, `instance_limit`, `over_registered`,
+  `machine_lost`, `signature_unverified` (an extra event: the license server's signed answer could not be
+  verified), `internal_dev_expired`, `unexpected_error`, `other`.
+- **Trial expiry:** from 5 days before, the log names the end date; at expiry an ERROR, then the instance stops
+  1 hour later. Paid licenses keep running past expiry until their next restart (which is refused).
+- **Renewal / trial extension:** the same key keeps working — the engine reads the new expiry at its next online
+  validation. The offline grace counts from the last successful online validation.
 
 **`stoatflow.timer.lane.mismatch.total{processor}`** — record keys whose re-serialization with the processor's timer
 key serde picks another lane than the record's, so the key's timers would run on another lane than its records.
@@ -119,7 +142,10 @@ caveats: `open.files` is not published (its RocksDB ticker is gone in the bundle
   flush, a timer or a scheduled source. Those planes fire on their own schedule and would re-poison
   every attempt, so the shutdown message names the plane. A `retry` on one of those planes is different
   and does **not** stop the instance: it means the send failed rather than the emission, so the epoch
-  replays and the send is re-attempted. Prevent the whole class by sizing the destination topic's
+  replays and the send is re-attempted. All of this is exactly-once with a production handler that is
+  asked: under at-least-once a `retry` is a `FAIL`, and `DefaultProductionExceptionHandler` without a
+  dead-letter topic is never asked — such a failure stops the instance with the offsets held under both
+  guarantees, and the pod's restart replays the epoch (KSC-151; Kafka Streams revives the task in place). Prevent the whole class by sizing the destination topic's
   `max.message.bytes`. The same offset hold covers every **synchronous** `FAIL` too (processing, sync
   production, punctuator/timer/scheduled-source): the epoch aborts, the instance stops, an operator
   restart replays it (the consumer records via the held offsets — a punctuator tick or scheduled-source
@@ -127,11 +153,22 @@ caveats: `open.files` is not published (its RocksDB ticker is gone in the bundle
   record was preserved, not dropped).
 - `stoatflow.dlq.abort.dropped.records` was **retired** (ADR-140). It counted the source records an abort
   permanently dropped; aborts no longer drop them.
-- `stoatflow.dropped.records.total{reason}` — seven reasons: `null_key`, `late_window`, `late_session`,
-  `join_null_key`, `join_null_value`, `table_source_null_key`, `null_window_value` (a time or sliding window whose value
+- `stoatflow.dropped.records.total{reason}` — eight reasons: `no_event_time` (a source record with no event time —
+  Kafka's `-1` "no timestamp" on a source whose time is the record timestamp, or `Long.MIN_VALUE` from a timestamp
+  extractor or assigner, as `LogAndSkipOnInvalidTimestamp` returns for a negative timestamp; skipped at ingestion with
+  a WARN at most once a minute per partition, its offset committed), `null_key`, `late_window` (also a record within
+  one window size of `Long.MAX_VALUE`, which joins no window), `late_session`,
+  `join_null_key` (also a foreign-key join's record with no foreign key — `null`, serializing to `null`, or reading
+  back as `null` — counted where Kafka Streams counts it), `join_null_value`,
+  `table_source_null_key`, `null_window_value` (a time or sliding window whose value
   the value serde reads back as `null`: its final `OnWindowClose` result is not emitted, counted once at close — a
   session in that state is forwarded as `null`, as in Kafka Streams). The tag *is* the semantics — always group
   by it rather than alerting on the bare total.
+- `stoatflow.sink.records.negative.timestamp.total{sink_name,topic}` — output records whose event time was negative
+  (a valid event time in StoatFlow). Kafka cannot store a negative timestamp, so the sink sends the record without one
+  and the producer (`CreateTime`) or broker (`LogAppendTime`) stamps the wall-clock time, as Flink's `KafkaSink` does.
+  Counted per record, one WARN per sink. An unexpected non-zero value usually means an upstream slip (a wrong-sign
+  extractor); set `FailOnInvalidTimestamp` / `LogAndSkipOnInvalidTimestamp` as the extractor to refuse negative input.
 - Store operation latency is `stoatflow.store.{get,put,delete,range,all,flush}.latency` (all `debug`).
 - `stoatflow.store.segments{store_name,store_type}` (`info`) — live RocksDB instances a **segmented**
   window/session store holds (~7 file descriptors each, no upper bound). Plateaus at
@@ -141,6 +178,24 @@ caveats: `open.files` is not published (its RocksDB ticker is gone in the bundle
   `withIdleness` if set, else `watermark.idleness-timeout-ms`), without which `idle` and `lastEventTimeMs`
   cannot be interpreted once timeouts differ per source. The
   RocksDB metric family sums its properties across segments and never publishes this count.
+- `stoatflow.store.segment.checkpoint.failures.total{store_name,store_type}` (`info`) — failed checkpoints of a
+  segmented window/session store, on the active or an HA standby. A checkpoint flushes the segments written since the
+  last one, then records the store's changelog position on disk; a failed one keeps the last recorded position (nothing
+  is lost, a WARN is logged), but while it keeps failing every restart replays more of the changelog. Alert on any
+  increase.
+- `stoatflow.barrier.epoch.uncommitted.bytes` (`info`) — uncommitted state bytes across all stores, the timer store
+  included (every timer backend), sampled ~1 Hz: the state total `stoatflow.state.uncommitted-max-bytes` caps (under exactly-once the cap also counts `stoatflow.eos.send.buffer.bytes`, below). Alert on it against that cap; the
+  dispatcher checks a projection (this plus the next records' estimated cost), so a `MEMORY_PRESSURE` barrier can fire
+  slightly below it. `stoatflow.store.uncommitted.bytes{store_name,store_type}` (`info`, KIP-892 `uncommitted-bytes`)
+  is the per-store share (sum + timer store = the global) — it shows which store drives memory-pressure commits; the timer
+  store has no series of its own, its share is the global minus the sum. It
+  counts the committed epoch still being flushed (memory, not visibility, KSC-117), is emitted for every store family
+  (KS: key-value only, KSC-118) and is `0` for `lruMap` / in-memory versioned stores.
+- `stoatflow.eos.send.buffer.bytes` (`info`, exactly-once only) — estimated heap bytes of the output held back while a
+  commit runs (the next epoch's records, kept until that commit is done). While the commit runs it counts with the
+  state bytes toward `stoatflow.state.uncommitted-max-bytes`, and past it dispatch pauses until the commit is done, so
+  dispatcher stalls with a low `epoch.uncommitted.bytes` point here: high fan-out, large output records or slow commits. Near 0 between commits; not
+  listed by an at-least-once application.
 - `stoatflow.watermark.lag.ms` (`info`) — `now − global watermark`, sampled every second **whether or not
   the watermark advanced** (until 2026-09-03 it was written only on an advance, so it froze at a healthy
   value during exactly the stall it exists to reveal); `-1` until the first watermark. Alert on it, and
@@ -152,6 +207,26 @@ caveats: `open.files` is not published (its RocksDB ticker is gone in the bundle
   already as high. Non-zero for long with no catch-up
   under way usually means a producer clock or a timestamp unit needs checking (`/watermarks` names the partition). It
   can also read non-zero while the application is paused or fully backpressured with such a record waiting.
+- Watermark alignment (`info` unless noted): `stoatflow.watermark.alignment.partitions.held{group}` (gauge — partitions
+  held: more than the drift ahead of a lagging group member; they keep being fetched), `…held.time.total{group}`
+  (counter, **seconds** a hold in the group stopped **all** dispatch — `rate()` is the waiting fraction; a sustained climb
+  = the drift is too small for a sparse source's gaps, size `drift ≥ G + b(sparse) − b(held)`), `…yields.total{group}`
+  (held records dispatched because every laggard had data — a flat `held.time.total` with rising yields means the
+  group's out-of-orderness bounds differ). `…drift.ms` / `…group.min` are `debug`. A hold that stops all dispatch for more
+  than 60 s logs one WARN naming the group, partition, empty laggards and the sizing rule; so does a group whose holds
+  keep the application waiting at least half of a 5-minute window (a sparse source sending more often than once a
+  minute), once until the share drops below half.
+- Bounded timer cache (`info`; only with a timer store — a processor declares timers, on any `timer-backend` — and,
+  for the four `watermark.*` meters, event-time tracking on and dispatch not `DIRECT`;
+  otherwise the series do not exist): `stoatflow.watermark.timer.held` (gauge 0/1 — event time
+  waits at the first stored event-time timer not yet loaded because more are due than `timer-backend.max-cached-timers`
+  holds; expected during a catch-up, frequent = cache too small; stuck at 1 with `timer.fired.total` flat = a stuck
+  `onTimer`), `stoatflow.watermark.timer.held.time.total` (counter, seconds; `rate()` = the waiting fraction),
+  `stoatflow.watermark.timer.frontier` (gauge, epoch ms, `NaN` when every timer is loaded), `stoatflow.watermark.raw`
+  (gauge — event time without the hold), `stoatflow.timer.cache.loaded{domain}` (timers in memory per domain, bounded by
+  the setting) and `stoatflow.timer.cache.overshoot.max{domain}` (how far above it since the last sample — a timer
+  registered for a time already loaded joins a full cache). A hold past 60 s logs one WARN `Event time has been held at
+  the timer frontier …` naming the loaded count, the bound and the frontier.
 - `stoatflow.store.versioned.sweep.lag.ms{store_name}` — ms since a versioned (KIP-889) store's last
   **completed** history-reclamation pass. Versioned retention is a *minimum* bound: reads stop answering
   for expired versions immediately, but the bytes go on a rolling sweep targeting one
