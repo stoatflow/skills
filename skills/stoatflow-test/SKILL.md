@@ -17,6 +17,11 @@ Two levels:
    TTD structurally *cannot* see (EOS transactions, changelog/restoration, cross-lane ordering). This is a
    **pattern**, not a shipped harness (see `references/integration-testing.md`).
 
+**Licence:** a `TopologyTestDriver` test needs none; a test that calls a real `StoatFlow.start()` needs a licence
+(`STOATFLOW_LICENCE_KEY`). Declare `STOATFLOW_LICENCE_ENVIRONMENT_CLASS=other` (locally and in CI, plus a stable
+`STOATFLOW_LICENCE_ENVIRONMENT`, e.g. `ci`, if the licence lists `other` or `*`): against a Testcontainers broker the
+licence registry lives in that throwaway cluster, so test runs count against nothing real.
+
 ## Dependencies
 
 ```kotlin
@@ -95,6 +100,13 @@ close).
 - **Headers-aware stores:** a write through the plain accessors (`put`, `compute`, `merge`) stores empty headers,
   as in KS; `test.driver.keep-existing-headers=true` (test-harness only) keeps an existing entry's headers instead
   (not on a duplicate-retaining window store, where a `put` appends — the driver WARNs).
+- **Explicit naming:** the driver runs the application's explicit-naming check only when its config **sets**
+  `ensure.explicit.internal.resource.naming` (`Properties`, `ensureExplicitNaming(true)`, or the
+  `StoatFlowTestDriver` YAML key `stoatflow.validation.ensure-explicit-naming`) — then a generated node or store name
+  throws the same `TopologyValidationException` the application throws at start. A builder created with a
+  `TopologyConfig` that sets the key checks in `build()`, as KS's does, so a driver over it refuses too. Unset, the
+  driver does not check (the application does by default). Set it to `true` in a test to catch a topology that would
+  refuse to start.
 - **`advanceWatermark`** is lenient by default (a backward request leaves the watermark where it is, and fires only
   the event-time timers already due); strict (forward-only throw) under manual mode.
 - **Negative event times are data** (KSC-138), as in production: windows near 0 are floor-aligned, so a KS-shaped
@@ -120,6 +132,12 @@ The TTD is a **fidelity approximation**, not the engine:
 - **In-memory only.** All stores (even RocksDB-`Materialized`) run as in-memory twins; **no changelog** is
   written. Changelog/restoration, **EOS transactional commits**, and cross-key/lane ordering are
   **structurally invisible** to the TTD — test those with a real broker.
+- **A punctuator runs on its own instance, in the driver too** (KSC-160). The constructor initialises a node's
+  punctuator instance; the first piped record initialises the instance `process()` runs on. Expect two `init()` calls
+  for a node with input; a punctuator never sees a field `process()` set (a field-buffer-then-flush test flushes
+  nothing), and a `Cancellable` cancelled from `process()` cancels nothing. Fix the processor (state in a store),
+  not the test — `references/testing-divergences.md`. Punctuators run synchronously in the advance, so the
+  application's exclusive-work pauses are invisible here.
 - **…but the exactly-once store checks judge the DECLARED store** (KSC-126). A table a join reads from another lane
   declared `Stores.persistentVersionedKeyValueStore` passes (the driver runs its in-memory twin); one declared
   `Stores.inMemoryVersionedKeyValueStore` or `Stores.lruMap` is refused under `exactly_once` (the default) — at driver
@@ -170,7 +188,10 @@ The TTD is a **fidelity approximation**, not the engine:
 
 `StoatFlowTestDriver.fromConfig(topologyBuilder, overrides?)` (from `:stoatflow-test-runtime`) loads the
 same `application.yaml` your runtime uses (via Hoplite + `ConfigMapper`) and returns a `TopologyTestDriver`
-— so a test exercises the real merged config, default serdes, and DSL store format. Java overloads take a
+— so a test exercises the real merged config, default serdes, DSL store format and store type
+(`stoatflow.dsl.store-suppliers-class`). A plain `TopologyTestDriver` applies `dsl.store.suppliers.class` /
+`default.dsl.store` from its `StreamsConfig` the same way: every store the topology leaves to the default takes it,
+then the driver keeps every store in memory (an LRU map a custom store type returns stays an LRU map). Java overloads take a
 `BiConsumer`/`Consumer`.
 
 ## Integration testing (a pattern — references/integration-testing.md)

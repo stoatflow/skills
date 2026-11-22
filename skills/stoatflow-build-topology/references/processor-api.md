@@ -10,8 +10,8 @@ Interfaces are `io.stoatflow.core.processor.*`.
 - Records: `Record<K,V>` (`.key`/`.value`/`.timestamp`; `withTimestamp(...)`, `withHeaders(...)`) and
   `FixedKeyRecord<K,V>`.
 - Suppliers: `ProcessorSupplier` / `FixedKeyProcessorSupplier` — `get()` **must return a fresh instance
-  every call** (the engine creates one per key-affinity lane); `stores()` (default empty) declares
-  `Set<StateStoreBuilder<*>>`.
+  every call** (the engine creates one per key-affinity lane, plus one **punctuator instance** per node — see
+  *Punctuators*); `stores()` (default empty) declares `Set<StateStoreBuilder<*>>`.
 
 ### Key affinity after a re-key (read before advising on per-key state)
 
@@ -137,8 +137,9 @@ that only reads the store (a join) is not moved. Processor API nodes that connec
 sub-topologies** (a re-key between them) can lose an update under either guarantee — their lanes cross barriers at
 different times. StoatFlow places nodes by key (KS forces them together, KAFKA-20464), so the build WARNs:
 `topology.validation.presumed-cross-sub-topology-write` (default `warn`). Only one of them writes (the rest read)?
-Nothing is lost — set it `off`. Otherwise connect the store from one sub-topology, or let one processor own it and
-forward what the others need. The same shape among DSL writers is refused.
+Nothing is lost — set it `off`. A punctuator counts as a writer: its exclusive work (below) pauses only its own
+sub-topology, so the other one's lanes keep writing meanwhile. Otherwise connect the store from one sub-topology, or let
+one processor own it and forward what the others need. The same shape among DSL writers is refused.
 
 **Cross-lane reads of `lruMap` / in-memory versioned stores.** Every other built-in store is read as of the reading
 lane's commit under `exactly_once`; these two write directly and their reads are live. A Processor API node that
@@ -195,23 +196,50 @@ Kafka timestamps — if the extracted times are earlier, the watermark passes th
 
 ## Threading — the rule that bites
 
-**One processor instance per lane** (the KS-task analog). Instance fields are per-lane and safe without
-synchronization — but state shared across lanes, or read from a punctuator, **must live in a state store**,
-not an instance field. A punctuator runs on a dedicated **punctuation lane** concurrently with record
-lanes, so its read-modify-write is **not** serialized against a key's record processing **within a commit**. For a
-per-key time-triggered mutation, prefer a **timer** (`onTimer` runs in the same per-key serialized context as
-`process`).
+**One processor instance per lane** (the KS-task analog), **plus one punctuator instance per node**. Instance fields
+are per-lane and safe without synchronization — but state shared across lanes, or between `process()` and a
+punctuator, **must live in a state store**, not an instance field (KSC-160, *Punctuators* below).
 
-- **Across commits, writes are ordered (both guarantees):** after each barrier a punctuation lane writes state only
-  once every record lane of its sub-topology has crossed it, so a punctuator's write and a record's write of the same
-  key never land in the wrong commit order. If the record lanes miss the barrier timeout the app stops (open epoch
-  aborted, replay from the last commit) rather than write out of order.
-- **Known issue — a punctuator's write to a key `process()` read-modify-writes can be lost (both guarantees):** a
-  punctuator that fires just before a barrier, or is still running when the next one passes, can run after a record
-  lane crossed it; if that lane already read and rewrote the key (e.g. incremented a counter), the punctuator's
-  decrement / reset / delete of it is lost. Fix under investigation. Until then, do such time-triggered per-key changes
-  from a **timer** (`onTimer` is serialized with the key's records); punctuators that only read, or write keys
-  `process()` never updates, are unaffected.
+**One key, one thread at a time, within a sub-topology.** A key's records, its timers, a LEFT/OUTER stream-stream
+join's unmatched results and an eager/time-limited `suppress()`'s releases and evictions all run on the key's lane, so
+keyed state behind them (a `count`, an aggregation) is never read-modify-written by two threads, and a key's emissions
+keep their order. A punctuator works on shared state only alone, at a commit barrier (below).
+
+**How a punctuator runs.** Each Processor API node's punctuators run on a thread of their own: one processor's
+punctuators one after another, **different processors' in parallel**, concurrently with the record lanes. A run's
+**free part** — everything before its first access to a connected store, its timer service or a `KeyLockManager`
+lock (external calls, computing, logging, global/read-only store reads, forwards) — pauses nothing. From that first
+access the run's **shared part** waits for the next commit barrier (one is created at once if none is due) and runs
+there as **exclusive work**: the sub-topology's record lanes stop at the barrier, the run continues alone, its forwards
+go downstream, then the lanes continue. A run that touched no state but forwards into its own sub-topology (anything
+before the next boundary, a sink included) takes a short exclusive window for the hand-off; forwards that only cross a
+boundary take none. A store of the user's own `StateStore` type (built by their own `StoreBuilder`, not `Stores`) is
+handed out as it is — `init()` may cast it to its class, as in Kafka Streams — but cannot report its first access: once
+the context has handed one out, every run of that processor's punctuators is a shared part from its start, the lanes
+stopped for the whole run.
+Advice to give:
+
+- **Keep the shared part short; do slow I/O first, touch stores last.** While it runs the sub-topology takes no input,
+  and under load the whole application's input stops (full lane queues stop the dispatcher for every source).
+  `stoatflow.subtopology.exclusive.work{reason,phase}` measures it; a window past 5 s logs a WARN naming the
+  punctuators; past `stoatflow.commit-stall.threshold-ms` (45 s) the app stops. A run with a shared part lasts at least
+  until its barrier, so a schedule shorter than that wait skips fires (locked-run: an overlapping fire is skipped).
+- **Writes follow processing order, not timestamps:** they land after every record dispatched before the barrier. A
+  read-then-write inside the shared part builds on the newest value; a blind write computed from earlier data (a field,
+  an external call, a free-part global read) replaces what a lane wrote earlier in the commit. To keep a newer value,
+  compare the stored `ValueAndTimestamp`, use a versioned store, or use a timer.
+- **Global and read-only stores never pause it**; in the free part they read committed data under `exactly_once` (up
+  to one commit behind a lane), in the shared part as the lanes do.
+- **Locks:** `KeyLockManager.withLock(s)` in a punctuator waits for the exclusive work first, then locks (uncontended).
+  For any **other** lock, semaphore or pooled resource shared with `process()`: never hold it across the punctuator's
+  first store, timer or `KeyLockManager` access — a lane blocked on it never reaches the barrier, and the commit-stall
+  watchdog stops the app.
+- **Graceful close** serves the runs in flight within the final commit's time limit; a run cut off commits nothing and
+  fires again after the restart.
+- **Long or per-key time-driven work belongs in a timer** (`onTimer` fires on the key's lane, timers of different keys
+  run in parallel, nothing pauses); record generation belongs in a scheduled source (`builder.scheduled()`). A
+  punctuator that scans and rewrites a large store pauses its sub-topology for the whole scan.
+
 - **After a crash under `at_least_once`, no state change is durable before its output** — a punctuator's, an
   `onTimer` call's, a record's, a downstream sub-topology's: each commit waits for the epoch's output to be
   acknowledged before the cached stores send their changelog records and the timer, versioned and `lruMap` stores
@@ -227,10 +255,45 @@ per-key time-triggered mutation, prefer a **timer** (`onTimer` runs in the same 
 
 ## Punctuators
 
-`context.schedule(interval, TimeNotion, PunctuatorMode?, callback)` → `Cancellable`. `TimeNotion.STREAM_TIME`
-(alias `EVENT_TIME`) / `WALL_CLOCK_TIME` (alias `PROCESSING_TIME`); Java `PunctuationType`/`TimeDomain`
-resolve to the same constants. `PunctuatorMode.BLOCKING` (default) / `NON_BLOCKING`. Anchored overload takes
-`startTime: Instant` (KIP-1146). Locked-run: an overlapping fire is skipped.
+`context.schedule(interval, TimeNotion, punctuator)` → `Cancellable` — exactly Kafka Streams'
+`schedule(Duration, PunctuationType, Punctuator)`; `Punctuator` is a fun interface, so a Kotlin or Java lambda or a
+method reference binds. `TimeNotion.STREAM_TIME` (alias `EVENT_TIME`) / `WALL_CLOCK_TIME` (alias `PROCESSING_TIME`);
+Java `PunctuationType`/`TimeDomain` resolve to the same constants. The anchored overload (KIP-1146) takes the start
+time first, as Kafka Streams does: `schedule(startTime: Instant, interval, type, punctuator)`. There is no execution
+mode: every punctuator runs as described under *Threading*.
+Locked-run: an overlapping fire is skipped.
+
+**A punctuator runs on its own instance (KSC-160, divergence).** Every Processor API node (`process`,
+`processValues`, `transformValues`, `addProcessor`) has a dedicated punctuator instance created at start;
+`schedule()` registers punctuators only there and they always run on it — `process()` never does. On a lane instance
+`schedule()` returns a `Cancellable` that does nothing. Same under the `TopologyTestDriver`. Two Kafka Streams
+patterns compile and then break **silently** — always rewrite them:
+
+- Records buffered in an instance field in `process()` and flushed from a punctuator → the punctuator's field is
+  empty, nothing flushes. Use a key-value store: `put` in `process()`, iterate and delete in the punctuator.
+- A `Cancellable` kept in a field and cancelled from `process()` → cancels nothing. Cancel from inside the punctuator
+  (it runs on the instance that scheduled it), or keep the decision in a store the punctuator reads.
+
+```kotlin
+// "batch-buffer" connected at the call site: process({ BatchingProcessor() }, named, "batch-buffer")
+class BatchingProcessor : ContextualProcessor<String, Event, String, Event>() {
+    private lateinit var buffer: KeyValueStore<String, Event>
+
+    override fun init(context: ProcessorContext<String, Event>) {
+        super.init(context)
+        buffer = context.getStateStore("batch-buffer")
+        context.schedule(Duration.ofSeconds(30), TimeNotion.WALL_CLOCK_TIME) { ts ->   // on the punctuator instance
+            val flushed = mutableListOf<String>()
+            buffer.all().use { it.forEach { e -> context.forward(Record(e.key, e.value, ts)); flushed += e.key } }
+            flushed.forEach { buffer.delete(it) }
+        }
+    }
+
+    override fun process(record: Record<String, Event>) {
+        buffer.put(record.key, record.value)   // a store, never a field: the punctuator runs on another instance
+    }
+}
+```
 
 **Fire times (Kafka Streams' `PunctuationSchedule`):** `STREAM_TIME` fires on the first data — the first watermark,
 negative or not — then on the grid aligned to 0 (every multiple of the interval); for a first watermark ≥ 0 that is
@@ -241,9 +304,9 @@ Inside the callback `context.timestamp()` is the punctuation time and `headers()
 not the last record's; it is one instance for the punctuation, so a header added there rides its `forward(key, value)`.
 
 **Start timing (Kafka Streams parity):** `init()` runs when the application starts — not with the first record —
-so a punctuator scheduled there (catch-up, heartbeat, TTL cleanup) runs even if no input arrives. One instance per
-node is initialised at start; the first lane to receive a record adopts it, the other lanes initialise theirs on
-their first record. In HA active/standby, `init()` runs when a pod becomes active, never on a standby. In `init()`,
+so a punctuator scheduled there (catch-up, heartbeat, TTL cleanup) runs even if no input arrives. The punctuator
+instance is initialised at start; each lane initialises its own instance on its first record (no lane adopts the
+punctuator instance), so a node with input runs `init()` / `close()` once more than on Kafka Streams. In HA active/standby, `init()` runs when a pod becomes active, never on a standby. In `init()`,
 `context.timestamp()` is the wall clock.
 
 ## Timers (🆕 Flink-style)
@@ -455,10 +518,15 @@ What a wrapper can do, by node kind:
 | `init`/watermark/suppress-flush/restore callbacks on DSL nodes | not routed through the wrapper; a DSL-node decorator's context also cannot `schedule()` / `timerService()` (both throw). `onTimer` is NOT bypassed — keyed timers exist only on Processor-API nodes, which Layer 1 wraps in full |
 | `addGlobalStore` / `addReadOnlyStateStore` state-update suppliers, engine-synthetic nodes | not wrapped (KS parity) |
 
-Two gotchas: the returned supplier's **`get()` runs once per lane** (not once per task), so decorator instance
-fields are lane-scoped — put cross-lane aggregation on the thread-safe wrapper object; and **node names are
-StoatFlow's** (`mapValues-0`, `process-0`, your `Named`), not KS's `KSTREAM-…-0000000001`, so a ported
-name-matching wrapper compiles and matches nothing. Zero overhead when the key is unset.
+Three gotchas: the returned supplier's **`get()` runs once per lane** (not once per task; plus once for a PAPI node's
+punctuator instance), so decorator instance fields are lane-scoped — put cross-lane aggregation on the thread-safe
+wrapper object; **node names are StoatFlow's** (`mapValues-0`, `process-0`, your `Named`), not KS's
+`KSTREAM-…-0000000001`, so a ported name-matching wrapper compiles and matches nothing; and **a decorator must never
+forward from `process()` of an emit-final node** — an `OnWindowClose` windowed / sliding / session / cogroup
+aggregation, an `untilWindowCloses` suppress, a strict `untilTimeLimit` suppress. Those nodes emit only when a window
+closes or a suppression ends; the first such forward fails with an error naming the wrapper and the node, never offered
+to the processing handler, and the app stops (KSC-161; Kafka Streams allows it). Decorating, observing and timing them
+is fine. Zero overhead when the key is unset.
 
 ## Scheduled sources (🆕 no KS equivalent)
 

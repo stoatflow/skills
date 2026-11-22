@@ -80,9 +80,29 @@ input.pipeInput("k", "b", windowStart + size + grace)  // past close → the win
 
 **Eager suppress buffers:** the driver is one lane, so `maxRecords(n)` / `maxBytes(n)` with `emitEarlyWhenFull()`
 gives it the whole bound and it emits its oldest record on overflow (a single KS task). In the application each writer —
-each lane of the suppress's sub-topology, plus its punctuation lane when an upstream operator emits from there — holds
-bound ÷ writer count (KSC-154), so a small bound emits early more often there: assert final results, not the number of
-early emissions.
+each lane of the suppress's sub-topology — holds bound ÷ writer count (KSC-154), so a small bound emits early more often
+there: assert final results, not the number of early emissions. Nor assert the order of different keys' releases
+across lanes: in the application each key leaves from its own lane, so only one key's results (and one lane's keys)
+keep buffer order — the driver, one lane, emits all of them in buffer order.
+
+## KSC-160 — a punctuator runs on its own instance, under the driver too
+
+Every Processor API node (`process`, `processValues`, `transformValues`, `addProcessor`) has a dedicated punctuator
+instance, in the driver as in the application. The driver's constructor initialises it (its `init()` registers the
+punctuators), and the first piped record initialises a second instance that runs `process()`. A Kafka Streams test
+can therefore break:
+
+- **`init()` counts:** a node with input runs `init()` (and `close()`) **twice** — expect two, not one.
+- **A punctuator reading a field `process()` set** sees its own instance's field — still empty. A test that pipes
+  records and then asserts what a punctuator flushed from a field-held buffer gets nothing. Fix the processor, not the
+  test: keep the buffer in a key-value store (put in `process()`, iterate and delete in the punctuator).
+- **A `Cancellable` kept in a field and cancelled from `process()`** cancels nothing — `schedule()` on the record
+  instance returns a do-nothing `Cancellable`. The punctuator keeps firing on `advanceWallClockTime` /
+  `advanceWatermark`. Cancel from inside the punctuator, or keep the decision in a store.
+
+The driver runs punctuators synchronously inside the advance, on one thread: it shows none of the application's
+exclusive-work pauses, parallel punctuators of different processors, or write ordering at a barrier. Cover those with a
+broker test (`integration-testing.md`).
 
 ## The unified opt-out: `test.driver.commit-per-pipe`
 
@@ -91,6 +111,16 @@ commit and the KSC-71 advance. Set it `false` for legacy manual control — pipe
 epoch nor advance stream-time (output is still emitted per record), and you drive both yourself via `commitBarrier()` / `advanceWatermark()`.
 Under manual mode, `advanceWatermark` is forward-only (a backward request throws); under the default it is
 lenient (a backward request is a silent no-op, matching KS stream-time).
+
+## The explicit-naming check runs only when the key is set (KSC-157)
+
+Kafka Streams checks `ensure.explicit.internal.resource.naming` in `StreamsBuilder.build()`, so a driver over a topology
+built with it on fails as the application would; the key is off by default. StoatFlow's application checks by default
+(node names too), and its driver runs the same check only when the driver's own config **sets** the key —
+`Properties`, `StreamsConfig.builder(...).ensureExplicitNaming(true)`, or the `StoatFlowTestDriver` YAML key
+`stoatflow.validation.ensure-explicit-naming`. Unset, a test of a topology with generated names keeps running; set it
+`true` in a test to catch a topology that would refuse to start. As in Kafka Streams, a `StreamsBuilder` created with a
+`TopologyConfig` that sets the key `true` checks in `build()`, so a driver over that builder refuses too.
 
 ## Writes through the plain accessors over a headers-aware store: `test.driver.keep-existing-headers`
 
@@ -129,6 +159,20 @@ The driver applies the engine's event-time rules: every `Long` but `Long.MIN_VAL
   driver counts offsets per topic).
 - **A sink stamps a negative event time with the driver's wall clock** (production writes no timestamp and the
   producer or broker stamps the wall clock), and counts it in `stoatflow.sink.records.negative.timestamp.total`.
+
+## Exception handlers in the driver
+
+- **The deserialization handler is asked** about a piped (or intermediate-topic) record the source cannot
+  deserialize, as in production and in KS's driver: CONTINUE skips it (its offset used up, nothing processed, stream
+  time unmoved) and routes its dead letters to an output topic you read with `createOutputTopic`; the default handler
+  lets the deserializer's own exception out of `pipeInput`.
+- **The production handler is asked** about a sink's key/value serialization or `StreamPartitioner` failure — never
+  the processing handler: CONTINUE drops the record and routes its dead letters; FAIL (the default for a
+  serialization error) rethrows the original exception, which a processing-handler CONTINUE cannot swallow.
+- **Every CONTINUE is counted** on the configured `InstrumentationCallback` — `onDroppedRecord("deserialization" |
+  "processing" | "production")` and `onDeadLettersSent(source, count)` — as in production, so a test can assert a
+  poison record was counted. Deserialization and production skips WARN once per topic under the driver (a running
+  application WARNs at most once a minute per partition for deserialization, per output topic for production).
 
 ## Wall clock in user code (KSC-133)
 

@@ -71,7 +71,10 @@ topology that reads no Kafka topic — so a test of such a source needs an input
 
 The driver initialises the processors when it is built, as Kafka Streams' driver does: each Processor API processor's
 `init()` runs in the constructor, so a `WALL_CLOCK_TIME` punctuator scheduled there fires on `advanceWallClockTime`
-before any record is piped, and an `init()` that throws (an undeclared state store, say) fails the constructor.
+before any record is piped, and an `init()` that throws (an undeclared state store, say) fails the constructor. That
+constructor-time instance is the node's **punctuator instance** (KSC-160): `process()` runs on a second instance, built
+on the first piped record, so a punctuator never sees `process()`'s fields and a node with input counts two `init()`
+calls (`testing-divergences.md`).
 
 A punctuator that throws — including a `forward` to a child name that does not exist — goes to
 `processing.exception.handler`, as in production: the default handler makes the `advance*` call throw; a CONTINUE

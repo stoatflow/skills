@@ -52,9 +52,22 @@ StatefulSet rollout already gives the guarantee.) Full manifest in
   `Describe` on the group, no warning without it) — act on it with the same rebuild.
 - **Shutdown:** `terminationGracePeriodSeconds` ≥ `stoatflow.shutdown.timeout-ms` / 1000 (default 25 s) with
   margin (e.g. 60). SIGTERM → graceful drain.
-- **License:** inject `STOATFLOW_LICENSE_KEY` from a `Secret`; production and trial **require**
-  `STOATFLOW_LICENSE_ENVIRONMENT` (one `application.id` + environment = one licensed instance; replicas and an
-  HA pair count once). Instance limit, trial expiry and renewal: references/rest-and-metrics.md.
+- **Licence:** inject `STOATFLOW_LICENCE_KEY` from a `Secret` (verified offline at `start()`; only usage reporting
+  — on by default for a trial — sends anything, to `licensing.stoatflow.io`);
+  production, enterprise and trial licences **require** `STOATFLOW_LICENCE_ENVIRONMENT`; declare
+  `STOATFLOW_LICENCE_ENVIRONMENT_CLASS` (`production` default, `staging`, `development`, `other`). Every instance
+  registers in the compacted topic `__stoatflow_licence` of the app's own Kafka cluster (heartbeat 30 s;
+  `__stoatflow_licence_history` is created too): grant the principal DESCRIBE, READ, WRITE (+ CREATE,
+  DESCRIBE_CONFIGS) on both, or pre-create them (references/kubernetes-and-ha.md). A start past the licensed count
+  is refused (`SERVICE_LIMIT`); a restart of a registered service never is — registered while an instance runs and
+  for 7 days after it was last seen, so a graceful or `Recreate` restart over the cap starts too, with as many
+  counted HA standbys as it ran (never an extra one) — and a running
+  instance is never stopped by the count. Registry unavailable: paid licences run `UNVERIFIED` (readiness UP, count unchecked), trials refuse
+  to start. **Renew without a restart:** `stoatflow-licence-tool apply licence.sfl1 --bootstrap-server …` writes the
+  renewal to the registry topic and running instances of that licence id switch at once (higher sequence number
+  only; per cluster). The same tool's `verify`, `status`, `report` (usage report `stoatflow-usage/1`, also
+  `GET /licence/usage`) and `fleet-report` (several clusters). Counting, expiry, renewal and reports:
+  references/rest-and-metrics.md.
 
 ## The runtime REST surface (details in references/rest-and-metrics.md)
 
@@ -62,7 +75,7 @@ The runtime serves an HTTP surface on `0.0.0.0:8080` by default (`runtime.http`)
 `/health/live` + `/health/ready` publicly; keep the rest in-cluster.
 
 - **Health:** `/health/live`, `/health/ready` · **Introspection:** `/info`, `/config` (masked),
-  `/topology`(+`/ks`,`/compiled`), `/state`, `/consumer`, `/offsets`, `/watermarks`, `/license` ·
+  `/topology`(+`/ks`,`/compiled`), `/state`, `/consumer`, `/offsets`, `/watermarks`, `/licence`, `/licence/usage` ·
   **Control:** `POST /pause`, `POST /unpause` · **HA** (only when `ha.mode != off`): `/ha/status`,
   `POST /ha/{switch,promote,demote}` · **Diagnostics** (`runtime.http.debug.enabled`): `/debug/threads`,
   `/debug/barriers` · **Metrics:** `/metrics`.
@@ -163,9 +176,14 @@ versioned, timer, window, session) also records which local and changelog format
 
 `GET /metrics` (Prometheus). `runtime.metrics.naming: stoatflow | kafka-streams | both` — use `both` to
 light up existing Kafka Streams dashboards during a migration. Headline alerts: barrier failures
-(`rate(stoatflow_barrier_failed_total[5m]) > 0`), license invalid (`stoatflow_license_valid == 0` with
-`for: 10m` — a fresh deploy reads 0 during the ~5-min license `PENDING` window), high consumer lag,
-watermark stall.
+(`rate(stoatflow_barrier_failed_total[5m]) > 0`), licence expiring (`stoatflow_licence_days_remaining < 30`) or invalid
+(`stoatflow_licence_valid == 0`), licence overage (`stoatflow_licence_services_registered >
+stoatflow_licence_services_cap`), registry unavailable (`stoatflow_licence_registry_available == 0`), high consumer lag,
+watermark stall. **The whole application's input stops for seconds at a time, then resumes?** Look at
+`stoatflow.subtopology.exclusive.work{sub_topology,reason,phase}` and its WARN: one sub-topology's punctuator store work
+(or its slow punctuation lane, `phase = waiting_for_p`) runs alone at a barrier, its lanes parked, and full lane queues
+stop dispatch for every source — shorten the punctuator's store part or move the work to timers
+(`references/rest-and-metrics.md`).
 
 ## Production checklist (the essentials)
 
@@ -185,7 +203,8 @@ watermark stall.
       record read as version 1.
 - [ ] Upgrades roll forward; a rollback is bounded by the newest build whose records a store holds.
 - [ ] Processing guarantee chosen on purpose; downstream consumers match.
-- [ ] License injected as a secret; readiness wired to license health.
+- [ ] Licence injected as a secret; readiness wired to licence health; renewal before expiry; registry topic ACLs
+  granted and `stoatflow_licence_registry_available` watched.
 - [ ] `/health/ready` (readiness) + `/health/live` (liveness) + a generous `startupProbe`.
 - [ ] `/metrics` scraped; alerts on lag / commit stalls / errors / restoration.
 - [ ] Output topics created before the start — every sink topic and every DLQ topic: a missing one refuses the start

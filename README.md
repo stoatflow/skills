@@ -7,7 +7,7 @@ Kafka-Streams training makes it *confidently wrong* on exactly the points where 
 import root, the `EXACTLY_ONCE` default, single-instance scaling (lanes, not replicas), the private Maven
 repository, watermark semantics, and more. This pack puts the right answers in front of the assistant.
 
-> **Targets StoatFlow 1.0.0-rc.5** (Kafka Streams 4.4 API surface). Pre-GA — the API may still
+> **Targets StoatFlow 1.0.0-rc.6** (Kafka Streams 4.4 API surface). Pre-GA — the API may still
 > change. If your StoatFlow version differs, use the matching tagged release of this pack (`git tag` /
 > release list).
 
@@ -46,9 +46,9 @@ stale answers. Pin the tag that matches your StoatFlow version.
 - **Docs:** <https://stoatflow.io/docs> · **Compatibility matrix:** <https://stoatflow.io/docs/reference/ks-compatibility-matrix>
 - **Retrieval-side complement:** <https://stoatflow.io/llms.txt> (index) · <https://stoatflow.io/llms-full.txt>
   (full bundle) — the same docs, machine-readable, for agents that fetch rather than load rules
-- **Trial / access:** <https://stoatflow.io> — StoatFlow itself is commercial and resolved from
-  `maven.stoatflow.io` with customer credentials (this pack is free and open, but the library it
-  documents is not).
+- **Trial / access:** <https://stoatflow.io/trial> — StoatFlow itself is commercial and resolved from
+  `maven.stoatflow.io` with customer or trial credentials; a free 30-day trial mails both the licence
+  and the Maven token (this pack is free and open, but the library it documents is not).
 - **Issues / PRs:** welcome here; fixes land upstream in the StoatFlow monorepo and mirror back.
 
 This pack is licensed under **Apache-2.0** (see `LICENSE`/`NOTICE`). The StoatFlow software is separate,

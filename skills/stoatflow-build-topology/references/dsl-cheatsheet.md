@@ -86,7 +86,8 @@ val counts: KTable<String, Long> =
 - `Materialized` → see `references/serdes-state-stores.md`
 - `AutoOffsetReset.earliest()/.latest()/.none()/.byDuration(d)` (KIP-1106)
 - `StreamPartitioner<K,V>` (KIP-837): returns `Optional<Set<Integer>>` — empty = default, single = route, empty
-  set = drop, multiple = multicast **on sinks only**. Lives in `topology/`. KS 4.4 shape (KIP-1321): StoatFlow calls
+  set = drop (counted as `dropped.records{reason=empty_partition_set}`, WARN once a minute per topic; sink and
+  `repartition()`, every dispatch mode), multiple = multicast **on sinks only**. Lives in `topology/`. KS 4.4 shape (KIP-1321): StoatFlow calls
   the default `partitions(topic,key,value,headers,numPartitions)` with the record's headers; override it in a
   **class** to route by headers. The 4-arg `(topic,key,value,numPartitions)` stays the single abstract method (a
   lambda still works, never sees headers, and gets a deprecated-for-removal warning). On `repartition()`

@@ -1,6 +1,6 @@
 # StoatFlow — rules for AI coding assistants
 
-> **Targets StoatFlow 1.0.0-rc.5 (Kafka Streams 4.4 API surface).** Pre-GA — pin the matching
+> **Targets StoatFlow 1.0.0-rc.6 (Kafka Streams 4.4 API surface).** Pre-GA — pin the matching
 > release of this file if your StoatFlow version differs.
 
 StoatFlow is a JVM stream-processing library that is **source-compatible with Kafka Streams 4.4 via an
@@ -69,6 +69,11 @@ Mis-routed by the blind swap (fix by hand / the OpenRewrite recipe fixes them): 
     (`MissingOutputTopicException`, naming it) — KS lets the first send create it. Create them, or set
     `validation.validate-output-topics=false` for a cluster that relies on auto-creation. A handler wrapping a built-in
     DLQ handler returns its delegate's `deadLetterTopics()`. *(KSC-148)*
+12. **A punctuator runs on its own instance** — every Processor API node has a dedicated punctuator instance, so a
+    punctuator never sees fields `process()` sets. A buffer filled in a field and flushed by a punctuator flushes
+    nothing; a `Cancellable` cancelled from `process()` cancels nothing — keep shared state in a store. Its store and
+    timer work runs alone at the next commit barrier, pausing the sub-topology: keep it short; long or per-key
+    time-driven work belongs in timers. *(KSC-160)*
 
 ## Config quick rules
 
@@ -100,13 +105,13 @@ dependencyResolutionManagement {
 }
 // build.gradle.kts
 dependencies {
-  implementation("io.stoatflow:stoatflow-runtime:1.0.0-rc.5")   // batteries-included (pulls -core)
-  // implementation("io.stoatflow:stoatflow-core:1.0.0-rc.5")   // DSL/engine only
-  // testImplementation("io.stoatflow:stoatflow-test-utils:1.0.0-rc.5")
+  implementation("io.stoatflow:stoatflow-runtime:1.0.0-rc.6")   // batteries-included (pulls -core)
+  // implementation("io.stoatflow:stoatflow-core:1.0.0-rc.6")   // DSL/engine only
+  // testImplementation("io.stoatflow:stoatflow-test-utils:1.0.0-rc.6")
 }
 ```
 
-Runtime needs a license: set `STOATFLOW_LICENSE_KEY` (value starts `key/…`, from your onboarding email).
+Runtime needs a licence, verified offline (no egress): set `STOATFLOW_LICENCE_KEY` (value starts `sfl1.`, from your onboarding email), and `STOATFLOW_LICENCE_ENVIRONMENT_CLASS` (`staging`, `development`, `other`) outside production.
 Requires **JDK 25 or newer** (CI tests JDK 25 and the newest JDK release, 27 today) with
 `--enable-native-access=ALL-UNNAMED` (the `io.stoatflow` Gradle plugin / Maven parent add it). Never inline a realistic token — credentials come from the customer portal.
 

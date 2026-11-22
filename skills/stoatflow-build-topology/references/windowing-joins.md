@@ -15,17 +15,23 @@ On `KGroupedStream`: `.windowedBy(TimeWindows|SlidingWindows)` → `TimeWindowed
 | Session | `SessionWindows.ofInactivityGapWithNoGrace(gap)` / `ofInactivityGapAndGrace(gap, grace)` |
 
 `Windowed<K>`: `windowStart()`/`windowEnd()` (millis), `windowStartTime()`/`windowEndTime()` (`Instant`),
-`key`/`window` (Kotlin) / `getKey()`/`getWindow()` (Java). Half-open `[start, end)`.
+`key`/`window` (Kotlin) / `getKey()`/`getWindow()` (Java). Bounds by window kind, as in Kafka Streams: tumbling and
+hopping `[start, end)`; sliding `[start, start + D]` (`windowEnd()` = `start + D`, a record's left window ends at the
+record; it closes at `windowEnd + 1 + grace`); session `[start, end]` (its first and last record's times).
+`window.contains(t)` (StoatFlow's) follows them — a sliding window's too, wherever StoatFlow builds it (output, store,
+IQ, a `suppress` behind it); one rebuilt from serialized bytes reads its end as excluded. `window.overlap(other)` is
+KS's: half-open for every `TimeWindow`, sliding included. A `suppress(untilWindowCloses)` behind a sliding aggregation
+(or a `merge` including one) releases a window when the aggregation closes it, one millisecond after KS's (KSC-164).
 
 **Any event time but `Long.MIN_VALUE`, negative included — windows near 0 differ from Kafka Streams.** Windows are
 floor-aligned for every time, with no clamp at 0: a record joins every window that contains it, including windows that
 start before 0. Tumbling and hopping windows differ from KS for a time below `size − advance`: a record at 5 s in 60 s
 windows advancing by 10 s joins six windows (starting −50 s … 0), where KS gives one, `[0, 60 s)`. A sliding record at
 `0 ≤ t < D` gets its own left window `[t − D, t]`, where KS combines those records into one `[0, D]` window. Results
-above those times are identical. Joins probe across 0 and emit LEFT/OUTER null sides in time order across 0;
+above those times are identical. Joins probe across 0 and emit LEFT/OUTER null sides across 0 as at any other time;
 `OnWindowClose` emits windows and sessions that end below 0. A Kafka Streams consumer of the windowed output fails on a
 negative window start (its `TimeWindowedDeserializer` builds a `Window`, which rejects one). At the other end, no window
-ends past `Long.MAX_VALUE`: a record within one window size of it (a sliding record at exactly `MAX`) joins no window and
+holds `Long.MAX_VALUE`: a record within one window size of it (a sliding record at exactly `MAX`) joins no window and
 is dropped as late, `stoatflow.dropped.records.total{reason=late_window}` (KS fails on it — its window end wraps).
 
 Session `aggregate(...)` **requires an explicit session merger** `(key, agg1, agg2) -> merged` as a third
@@ -65,16 +71,20 @@ source uses `WatermarkStrategy.noWatermarks()` (it pins the watermark for the wh
 extension). The bound covers the whole application, not one task (KSC-154: size a KS bound × the input partitions, at
 least one record per writer). Each `suppress()` has its own buffer; an eager one gives each writer an even share of the
 bound (bound ÷ the writer count, rounded down — a record larger than a writer's byte share leaves at once). The writers
-are the lanes of its sub-topology and, when an upstream operator emits on watermark/punctuator time (a LEFT/OUTER
-stream-stream join's unmatched side, an `OnWindowClose` aggregation, a Processor API punctuator), its punctuation lane.
-A writer over its share emits its own oldest keys (earliest buffer time, then key bytes) — never another lane's key, though
-the punctuation lane also emits restored keys and any beyond a writer's share while the buffer is over its bound; with
-skewed keys a busy lane emits early at its share while other shares sit unused; a key's values leave in buffered order and every writer keeps suppressing (with a `processor.wrapper.class` set, a suppress
-behind an `OnWindowClose` aggregation counts its lanes as writers too: its punctuation lane gets bound ÷ (lanes + 1)); after a restart the next watermark
-advance emits the oldest restored keys early while the buffer is over its bound. Over a bound after a put
+are the lanes of its sub-topology; only a buffer no lane writes (behind an `OnWindowClose` aggregation) has one writer,
+its punctuation lane, with the whole bound. Every buffered key belongs to the lane it runs on, and **only that lane
+takes it out** — time-limit releases and evictions alike (KSC-154, amended): a writer over its share emits its own
+oldest keys (earliest buffer time, then key bytes); with skewed keys a busy lane emits early at its share while other
+shares sit unused; a key's values leave in buffered order and every writer keeps suppressing. After a restart or an HA
+promotion — a different lane count included — each restored key belongs to the lane it now runs on, which evicts its
+oldest within its share on its next write. A key with no lane (a sub-topology whose lanes a `repartition()` partitioner
+picks, or one a punctuator's forward first buffered) is taken out at the next commit barrier while the lanes wait. A
+`processor.wrapper.class` changes no writer count (KSC-161). Over a bound after a put
 (`records > maxRecords || bytes > maxBytes`, KS's check) a strict one throws `BufferFullException` to the processing
 exception handler (the default shuts down). Every emission carries the latest buffered update's **headers, timestamp and source coordinates** (`topic()` / `partition()` / `offset()` downstream, as in KS) and is never `isLate()`;
-records released together leave in (buffer time, key) order; `untilWindowCloses` drops a `null` final result (KS).
+records released together leave in (buffer time, key) order **per key and per lane** — keys on different lanes have
+no fixed order relative to each other (each key is emitted by its own lane; KS orders them within a task), and a buffer
+only the punctuation lane writes leaves wholly in that order; `untilWindowCloses` drops a `null` final result (KS).
 **`untilTimeLimit` (KS semantics):** every update is buffered — the first too — and a key leaves `duration` after its
 **first** buffered update with its latest value, once the watermark reaches that update's timestamp + `duration`; it is
 measured on the **watermark**, not KS's task stream time (KSC-119: `Duration.ZERO` emits on the next watermark
@@ -148,7 +158,8 @@ GlobalKTable joins only: `ValueJoinerWithStreamAndMappedKey<K,GK,V,GV,VR> = (str
 - **Stream-stream:** `left.join(right, joiner, JoinWindows.ofTimeDifferenceWithNoGrace(d), StreamJoined?)`
   — `join`/`leftJoin`/`outerJoin`. Self-joins work (`s.join(s, …)`, `s.join(s.mapValues{…}, …)`): every
   record is matched as left and right, as in KS. `JoinWindows`: `ofTimeDifferenceWithNoGrace(d)` /
-  `ofTimeDifferenceAndGrace(d, grace)` / `.before(d)` / `.after(d)`. `StreamJoined`: `.as(name)`,
+  `ofTimeDifferenceAndGrace(d, grace)` / `.before(d)` / `.after(d)`. `StreamJoined`: `.as(storeName)` (the
+  stores' base name, as KS — not the processor's), `.withName(name)` (the processor),
   `.with(keySerde, leftValueSerde, rightValueSerde)`, `.withStoreName(base)` (→ `{base}-left-store` /
   `{base}-right-store`), `.withChangelogNumPartitions(n)` (StoatFlow extension — **multiplied**: it sets
   the count on both buffers, plus `-outer-store` on LEFT/OUTER, so `(6)` is 12 or 18 partitions),
@@ -157,8 +168,11 @@ GlobalKTable joins only: `ValueJoinerWithStreamAndMappedKey<K,GK,V,GV,VR> = (str
   or the build throws `KSC-99`, as Kafka Streams' does; a timestamped or headers-aware `Stores` supplier is accepted too and builds the same plain buffer, since the
   join keeps its serializers' headers in the stored values; a hand-written supplier whose builder is timestamped,
   headers-aware or versioned is refused),
-  `.withDslStoreSuppliers(StoreType.IN_MEMORY)` (both stores retain duplicates), `.withLoggingDisabled()`. **Unmatched left/outer results
-  emit when the window closes** (watermark-driven), not on left-record arrival. A record whose window has **already
+  `.withDslStoreSuppliers(Materialized.StoreType.IN_MEMORY)` (both stores retain duplicates; a left/outer join's outer store takes its backend too), `.withLoggingDisabled()`. **Unmatched left/outer results
+  emit when the window closes** (watermark-driven), not on left-record arrival — **on the key's own lane**, so an
+  aggregation behind the join never sees one key on two threads. Their order relative to other keys' results is not
+  fixed, and a null side may follow a later match of the same key with another partner (KS, which throttles these
+  emissions, can do the same); a late match against the buffered record itself never also yields its null side. A record whose window has **already
   closed** when it arrives (`ts + after` for a left record / `ts + before` for a right one, `+ grace`, at or behind the
   watermark) is never buffered: if unmatched, its null-side result is emitted at once under its own timestamp — Kafka
   Streams' late branch; only the clock differs (watermark vs KS stream time).

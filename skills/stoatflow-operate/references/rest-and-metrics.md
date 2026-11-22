@@ -6,8 +6,8 @@ Read endpoints are `GET` (wrong method → 405; pre-startup → 503). **Expose o
 
 | Endpoint | Method | Purpose |
 |---|---|---|
-| `/health/live` | GET | Liveness — process healthy enough to stay alive? (200 UP / 503 DOWN). Flips DOWN if the commit pipeline freezes past `stoatflow.commit-stall.threshold-ms` (45 s). License never fails liveness. |
-| `/health/ready` | GET | Readiness — ready to process? 503 throughout restoration. The ~5-min license `PENDING` window after start is UP (the pod takes traffic). License `EXPIRED`/`REVOKED`/`INVALID`/no key → 503; the instance-limit state is `INVALID` with `reason: instance_limit` while the pod keeps processing. |
+| `/health/live` | GET | Liveness — process healthy enough to stay alive? (200 UP / 503 DOWN). Flips DOWN if the commit pipeline freezes past `stoatflow.commit-stall.threshold-ms` (45 s). The licence never fails liveness. |
+| `/health/ready` | GET | Readiness — ready to process? 503 throughout restoration. Licence `VALID`, `UNVERIFIED` (registry unavailable, count unchecked) and `EXPIRED` are UP (an expired licence never stops a running instance); no licence (`NO_KEY`) → 503. |
 | `/info` | GET | App id, effective lane count (`app.lanes`) and record-lane thread type (`app.laneThreadType`; under DIRECT dispatch, `topology.dispatchMode`, no record lanes run), JVM/Kafka info, uptime, state, registered endpoints. |
 | `/config` | GET | Merged effective config, secrets masked (YAML; JSON via `Accept`). |
 | `/topology` `/topology/ks` `/topology/compiled` | GET | Native view · Kafka-Streams-compatible `describe()` view · compiled internal view. `/topology/ks` (JSON with `Accept: application/json`) is the pull equivalent of KS 4.4's KIP-1331 topology-description push — StoatFlow is a classic consumer group, so `describeStreamsGroups` never lists it (KSC-113). |
@@ -15,7 +15,8 @@ Read endpoints are `GET` (wrong method → 405; pre-startup → 503). **Expose o
 | `/consumer` | GET | Consumer-group metadata, subscription, last commit time, per-partition buffer + pause state (`paused` for any reason: full buffer, the application pause, start-up restoration; watermark alignment never pauses). |
 | `/offsets` | GET | Per-partition committed source offsets + lag, and committed changelog offsets per store. |
 | `/watermarks` | GET | Global + per-partition event-time watermarks, idle flags, last event times. A partition whose next record is stamped in the future and held behind older records also shows `previewWatermarkMs` (what it counts with in the global watermark, while that is above its own) and `headHeldSinceMs`. With watermark alignment: `alignmentGroup`, `alignmentHeld`, `driftFromGroupMinMs` per partition, `alignmentGroupMins`, and `alignmentBinding` — `{group, partition, emptyLaggards, sinceMs}` of the hold keeping the whole application waiting, or `null` (also while a pause or backpressure, not the hold, is what stops dispatch; `sinceMs` survives that). A partition that waited in a hold with records buffered does not count that wait as silence: its `lastEventTimeMs` moves forward by it afterwards. Bounded timer cache (every timer backend): `rawGlobalMs`/`rawGlobalIso` (event time without the timer hold — ahead of `globalMs` only while it binds), `timerFrontierMs` (the first stored event-time timer not yet loaded, `null` when all are; `globalMs` never passes it; it moves back when a timer registers below it, `globalMs` never does), `timerHeld`/`timerHeldSinceMs`, and per partition `timerFrontierHeld` with `timerFrontierHeadMs` (the waiting record's time) and `timerFrontierContributionMs` (what it counts with — capped at the frontier, so it moves back with it). |
-| `/license` | GET | Runtime license-validation state: status, tier, expiry, `machinesUsed` (instances **registered** against the license — briefly includes ones that just stopped) vs `machinesAllowed` (instances it **covers**). |
+| `/licence/usage` | GET | The licence usage report (`stoatflow-usage/1`, the same JSON as `stoatflow-licence-tool report`) for `from`…`to` (UTC days, `YYYY-MM-DD`; default the last 30 days, at most 400), read from the licence history topic on demand; `include-app-names=true` adds names in clear (hashed otherwise). 400 bad parameter, 503 no licence registry / history unreadable. In-cluster only. |
+| `/licence` | GET | Offline licence state: `status` (`VALID`, `UNVERIFIED`, `EXPIRED`, `NO_KEY`), `licenceId`, `sequence`, `licensee`, `customer`, `tier`, `scope`, `expiresAt`, `daysRemaining`, `restartGraceEndsAt`, `environmentClass`, `environment`, `service`, `applicationId`, `haMode`, `haRole`, `clusterId`, `allowances` (per class: `licensed`, `cap`, `registered`, `starting`, `standbysRunning`, `standbysCounted`, `free`), `services` (`service`, `environment`, `class`, `applicationIds`, `counts`) and `registry` (`available`, `topic`, `historyTopic`, `brokerClock`, `clockSkewMs`). |
 | `/pause` `/unpause` | POST | Pause (→ `DRAINING` → `PAUSED`, readiness DOWN, no rebalance) / resume (→ `RUNNING`). Wrong state → 400. |
 | `/ha/status` | GET | HA cluster view (only when `ha.mode != off`; else 404). |
 | `/ha/switch` `/ha/promote` `/ha/demote` | POST | Role commands (202 + `commandOffset`). |
@@ -64,7 +65,7 @@ epoch flush timer — StoatFlow commits every store at every barrier, so the rat
 Main metric families (level `info`): throughput/latency (`stoatflow.lane.records.processed.total`,
 `stoatflow.lane.process.latency`, `stoatflow.e2e.latency`), barrier commits
 (`stoatflow.barrier.{completed,failed,abandoned}.total` — abandoned = deliberately not committed, `reason` `pre_assignment`/`poison_abort`/`abort_teardown`/`not_broadcast`, not a failure; `failed`'s `error_type` `fatal_error` = an `Error` (`TODO()`, `AssertionError`) thrown by user serde/store code during a commit; `unhandled_send_failure` = an at-least-once send that failed with no production handler to decide it (a changelog record, a dead letter, an output under the default handler without a `dlqTopic`) or fatally, and `poison_epoch` = a handler's `FAIL` for an asynchronous send failure (a handler that throws or returns `null` included) — both stop the commit before it writes anything, offsets held, so the restart sends again (a record too large for its topic recurs on every start until `max.message.bytes` is raised) — `stoatflow.barrier.commit.latency`,
-`stoatflow.barrier.trigger.total{TIME,RECORD_COUNT,MEMORY_PRESSURE,CACHE_PRESSURE}`), watermarks
+`stoatflow.barrier.trigger.total{TIME,RECORD_COUNT,MEMORY_PRESSURE,CACHE_PRESSURE,EXCLUSIVE_WORK}` — `EXCLUSIVE_WORK` = a punctuator waits to touch its sub-topology's state, so a barrier is created at once; `stoatflow.subtopology.exclusive.work`, below), watermarks
 (`stoatflow.watermark.{current,lag.ms,late.records.total,preview.partitions}`), changelog/restoration
 (`stoatflow.restoration.{in.progress,records.restored.total}`; `stoatflow.restoration.remaining.records{store_name}` — records a store still has to restore, 0 once done), consumer/producer
 (`stoatflow.consumer.lag.records`; `stoatflow.consumer.partition.forgotten.total{reason}` — source partitions
@@ -72,31 +73,75 @@ dropped because their topic is gone (`topic_deleted` = a deleted pattern topic, 
 restart; `ha_source_shrink` = the HA detector's confirmed shrink);
 `stoatflow.source.pattern.matched.topics{source}` — topics a pattern source
 currently matches, `0` = matches nothing yet), client state (`stoatflow.client.state` — ordinal, `== 4` = RUNNING =
-healthy-and-processing), HA (`stoatflow.ha.*`, only when on), and license
-(`stoatflow.license.valid{tier}`; `…validations_total{result}`, `…heartbeats_total{result}`, `…pings_total{result}`
-— see below). JVM/Kafka-client metrics via `bind-jvm-metrics` (default true).
+healthy-and-processing), HA (`stoatflow.ha.*`, only when on), and licence
+(`stoatflow.licence.valid{tier}`, `stoatflow.licence.days.remaining`, `stoatflow.licence.grace.remaining.seconds`,
+per class `stoatflow.licence.services.{registered,licensed,cap,starting,standbys.running,standbys.counted}`
+`{environment_class}`, `stoatflow.licence.registry.{available,broker.clock}`, `stoatflow.licence.history.available` — see below). JVM/Kafka-client metrics via `bind-jvm-metrics` (default true).
 
-**License: instances, limit, expiry.**
-- One `application.id` + environment is one licensed instance; replicas and an HA pair count once. A running
-  instance stays counted through a heartbeat ping (`stoatflow.license.pings_total{result=success|machine_lost|network_failure|other}`
-  — a failed ping never stops anything); a stopped one frees its slot within about the license's heartbeat window.
-  Renaming an environment registers a new instance.
-- **Instance limit.** A new instance whose license is full is refused at its deferred validation (~5 min after
-  start: "StoatFlow instance allowance exhausted…") and shuts down. A *running* instance that loses its
-  registration and cannot register again keeps processing, reports `INVALID` + `reason: instance_limit` (readiness
-  503, liveness UP), retries every heartbeat and recovers once a slot frees. Alert:
-  `increase(stoatflow_license_validations_total{result="instance_limit"}[1h]) > 0`.
-- **Over-registered license** (its limit was lowered below the registered instances): every instance logs a
-  warning and keeps running, readiness UP, liveness detail `licenseOverRegistered`, `result="over_registered"`.
-  The fix is the vendor's (contact your StoatFlow administrator).
-- `validations_total` / `heartbeats_total` `result` is a fixed set: `success`, `invalid`, `expired`, `revoked`,
-  `network_failure`, `offline_grace_exhausted`, `environment_required`, `instance_limit`, `over_registered`,
-  `machine_lost`, `signature_unverified` (an extra event: the license server's signed answer could not be
-  verified), `internal_dev_expired`, `unexpected_error`, `other`.
+**Licence: expiry and renewal.** The licence is a signed `sfl1.…` string verified offline at `start()`; verification
+needs no network. Only usage reporting (below) sends anything.
+- **Counting.** Each instance heartbeats (30 s) into the compacted topic `__stoatflow_licence`. Per environment
+  class a *(service, environment)* pair with at least one live instance counts once (up to two live application ids
+  of one service count once, a third counts 2), plus HA standbys per the licence's standby term. Liveness follows the
+  brokers' clock: no heartbeat for 90 s and the instance stops counting; a graceful stop leaves at once; another
+  pod's STARTING record is shown, never counted. A start that would exceed the licensed count (times 1 + burst,
+  default 0) is refused with `SERVICE_LIMIT`; a restart of a registered service never is; a running instance is
+  never stopped by the count (overage logs a WARN hourly and shows on `/licence`). Classes the licence does not list
+  are free.
+- **Registry unavailable:** paid licences run `UNVERIFIED` (licence verified, expiry enforced, count unchecked,
+  background retry); trials refuse to start. With `message.timestamp.type=CreateTime` on the registry topic, host
+  clocks are used, each start waits 90 s, and an hourly WARN is logged.
+- **Gauges.** `stoatflow.licence.valid{tier}` is 1 while the status is `VALID` or `UNVERIFIED`; `stoatflow.licence.days.remaining`
+  counts down to expiry; `stoatflow.licence.grace.remaining.seconds` counts the seconds to the end of a paid
+  licence's 30-day restart grace (expiry + 30 days) through the whole term, not only after expiry (Prometheus:
+  `stoatflow_licence_valid`, `stoatflow_licence_days_remaining`, `stoatflow_licence_grace_remaining_seconds`). Per
+  class (tag `environment_class`: `production`, `staging`, `development`, `other`): `stoatflow.licence.services.registered`,
+  `.licensed` and `.cap` (NaN when unlimited or free), `.starting`, `.standbys.running`, `.standbys.counted`. Registry:
+  `stoatflow.licence.registry.available` (1/0) and `stoatflow.licence.registry.broker.clock` (1/0). History:
+  `stoatflow.licence.history.available` (1/0; 0 = the usage history has a gap — a failed write, or a topic that cannot be set up — nothing else changes; every instance of a deployment reports the state of the one instance that writes its history while the registry is available, its own otherwise; `historyGapHours` misses the last hours of an instance that stopped while the history was unwritable, so alert on the gauge).
+- **Paid licences** (developer, production, enterprise): from 30 days before expiry the log warns daily and the
+  health liveness detail `licenceRenewalWarning` is set; readiness is unaffected. A running instance is **never
+  stopped** by expiry. For 30 days after expiry a restart starts with an ERROR (`/licence` shows
+  `restartGraceEndsAt`); after that no instance starts, so an expired fleet goes down at its next reschedule.
 - **Trial expiry:** from 5 days before, the log names the end date; at expiry an ERROR, then the instance stops
-  1 hour later. Paid licenses keep running past expiry until their next restart (which is refused).
-- **Renewal / trial extension:** the same key keeps working — the engine reads the new expiry at its next online
-  validation. The offline grace counts from the last successful online validation.
+  1 hour later; a restart is refused unless an extension was applied. An extension applied with
+  `stoatflow-licence-tool apply` cancels the stop, and a later restart starts on it. One trial per Kafka cluster: a
+  trial licence that starts after another one on the cluster ended is refused `SERIAL_TRIAL` (the trial ledger, `T|`
+  records in the registry topic); one already running when the other ended is not, nor an extension of the same trial.
+- **Renewal:** a new licence string with the same licence id and a higher sequence number. `stoatflow-licence-tool
+  apply licence.sfl1 --bootstrap-server … [--command-config client.properties] [--topic …]` verifies it offline and
+  writes it to the registry topic: every running instance of that licence id switches to it at once (ends a restart
+  grace) and later starts use it over a configured lower one — also once the configured one expired, or on a cluster
+  or environment class only the renewal covers; a lower sequence number is refused by the tool and ignored by the
+  engine (no rollback), and so is a licence bound to other Kafka clusters (`CLUSTER_NOT_LICENSED`). Apply it on each
+  cluster. Or replace the configured licence; each instance reads it at its next restart.
+- **Usage reporting:** `stoatflow.licence.reporting.enabled` (env `STOATFLOW_LICENCE_REPORTING_ENABLED`; unset = on
+  for a trial, off otherwise; only `true`/`false`, anything else WARNs and reads as unset; a licence with
+  `"reporting": "required"` WARNs daily while off, never stops). Once a day after 02:00 UTC (the history's clock, the
+  brokers') + up to an hour, fixed per instance, the lowest live fingerprint among the instances that report `POST`s the previous UTC day's usage report
+  (the `/licence/usage` JSON, names hashed, its registry topic as a hash) with its licence to
+  `https://licensing.stoatflow.io/v1/usage`; a trial also sends one `activated` event per cluster. Nothing goes while
+  the Kafka cluster id is unreadable; each attempt — activation or daily report — at most once per UTC day. Bookkeeping in `R|<lid>` on the registry topic; `/licence` `reporting`
+  (`enabled`, `required`, `lastSent`, `lastResult`); `stoatflow.licence.reporting.sent.total{result}` (`sent`,
+  `duplicate`, `failed`). A failure (an unreadable history topic too) is retried the next day, catching up to 7 missed
+  days; it never touches status, readiness or processing. Air-gapped: `report` + upload at
+  https://licensing.stoatflow.io/, or `POST {"kind": "report", "licence": "sfl1…", "report": …}` (at most 400 days).
+- **Usage history and reports:** each instance writes its usage to `__stoatflow_licence_history` (400 days, never
+  read at start): per UTC day the fingerprints that ran, per hour the peak count of its class. `stoatflow-licence-tool
+  report --licence <lid> --from … --to …` (or `GET /licence/usage`) computes the report: per class peak concurrent,
+  distinct services, for licensed classes p95/avg daily peak, days over the licensed count and standbys; per
+  environment, per day, engine versions; `registry.brokerClock` (the history topic's clock), `unverifiedHours`,
+  `historyGapHours`. App ids and services are hashed unless `--include-app-names`; `--timeout PT10M` gives a long
+  history read more than its 2 min. `fleet-report a.json b.json …` (or `--bootstrap-servers` once per cluster, each
+  that cluster's bootstrap list) sums each cluster's daily peaks over one period and lists the clusters. `status` shows what the registry counts per licence, live by the
+  brokers' clock (`"stale": true` when nothing heartbeated for minutes; `"liveness": "writer-clock"` on a `CreateTime`
+  topic); `verify` checks a licence offline. Exit codes: 0 done, 1 refused, 2 usage/connection error.
+- **Refusals** throw `LicenceValidationException` (`code`: `MALFORMED`, `INVALID_SIGNATURE`, `UNKNOWN_KEY`,
+  `KEY_SCOPE`, `NOT_YET_VALID`, `EXPIRED`, `NEW_SERVICE_AFTER_EXPIRY`, `TRIAL_EXPIRED`, `INTERNAL_EXPIRED`,
+  `ENVIRONMENT_REQUIRED`, `ENVIRONMENT_CLASS_UNKNOWN`, `CLASS_NOT_LICENSED`, `SERVICE_LIMIT`,
+  `CLUSTER_NOT_LICENSED`, `REGISTRY_UNAVAILABLE`, `NO_REGISTRY_LICENCE`, `SERIAL_TRIAL`, `INVALID_SETTING`) from `start()`. A licence may name Kafka
+  cluster ids; elsewhere it is refused `CLUSTER_NOT_LICENSED`. Restart grace (paid, 30 days after expiry): services
+  that ran during the term restart with an ERROR, a new one is refused `NEW_SERVICE_AFTER_EXPIRY`.
 
 **`stoatflow.timer.lane.mismatch.total{processor}`** — record keys whose re-serialization with the processor's timer
 key serde picks another lane than the record's, so the key's timers would run on another lane than its records.
@@ -120,6 +165,10 @@ stores, so prefer those over the per-store duplicates that exist for KS-dashboar
 caveats: `open.files` is not published (its RocksDB ticker is gone in the bundled RocksJava), and
 `*.min.ms` is JNI-only (the default FFM backend's statistics dump has no MIN token).
 
+- `stoatflow.dlq.records.sent.total{source}` — dead letters the exception handlers sent, by handler
+  (`deserialization`, `processing`, `production`): a dead-letter topic's inflow without reading the topic. Under
+  exactly-once a dead letter of an epoch that is aborted and replayed is counted again when the replay sends it.
+  StoatFlow-only (Kafka Streams has no such meter).
 - `stoatflow.dlq.poison.replays.total` — **the one to alert on.** Poison-epoch replays: an asynchronous
   broker-side production failure aborted an epoch, and rather than advancing past it StoatFlow held the
   source offsets, restarted the engine in place, and reprocessed the epoch with the poison quarantined.
@@ -153,7 +202,19 @@ caveats: `open.files` is not published (its RocksDB ticker is gone in the bundle
   record was preserved, not dropped).
 - `stoatflow.dlq.abort.dropped.records` was **retired** (ADR-140). It counted the source records an abort
   permanently dropped; aborts no longer drop them.
-- `stoatflow.dropped.records.total{reason}` — eight reasons: `no_event_time` (a source record with no event time —
+- `stoatflow.dropped.records.total{reason}` — twelve reasons. Three are the exception handlers' `continue`, each counted
+  as Kafka Streams counts it in `dropped-records`: `deserialization` (a key or value that failed to deserialize; also
+  a WARN with the exception, at most once a minute per partition), `processing` (a record, timer fire, punctuation or
+  scheduled-source fire that failed in user code; no engine log line, the handler logs), `production` (a key or value
+  that failed to serialize, a failing partitioner, or an at-least-once send the broker rejected — WARN at most once a
+  minute per output topic; under exactly-once the source record skipped by the poison replay, counted once, when a
+  commit moves past it). Alert on a rise of those three. Each drop is counted when it takes effect, so records
+  processed again (a failed commit, a restart, an exactly-once replay) are counted again, as in Kafka Streams — except
+  the source record an exactly-once replay skips, counted once however many replays skip it. A
+  `continue` whose dead-letter send fails at once is a `fail` and counts nothing; a dead letter the broker rejects later
+  fails the commit. `empty_partition_set`: a `StreamPartitioner` returned an empty set (KIP-837's drop) at
+  a sink (also in `stoatflow.sink.records.dropped.total{sink_name,topic}`) or a `repartition()` — WARN at most once a
+  minute per topic. The rest: `no_event_time` (a source record with no event time —
   Kafka's `-1` "no timestamp" on a source whose time is the record timestamp, or `Long.MIN_VALUE` from a timestamp
   extractor or assigner, as `LogAndSkipOnInvalidTimestamp` returns for a negative timestamp; skipped at ingestion with
   a WARN at most once a minute per partition, its offset committed), `null_key`, `late_window` (also a record within
@@ -196,6 +257,34 @@ caveats: `open.files` is not published (its RocksDB ticker is gone in the bundle
   state bytes toward `stoatflow.state.uncommitted-max-bytes`, and past it dispatch pauses until the commit is done, so
   dispatcher stalls with a low `epoch.uncommitted.bytes` point here: high fan-out, large output records or slow commits. Near 0 between commits; not
   listed by an at-least-once application.
+- `stoatflow.subtopology.exclusive.work{sub_topology,chain,reason,phase}` (`info`, Timer) — how long a sub-topology's
+  record lanes stood parked at a commit barrier while work on its state ran alone, one sample per pause and phase.
+  `reason = punctuator`: a Processor API punctuator's shared part — from its first connected-store, timer or
+  `KeyLockManager` access, a punctuator's work runs alone at the next barrier (its earlier "free part" pauses nothing);
+  `reason = list`: join or suppress entries that belong to no lane (a sub-topology whose lanes a `repartition()`
+  partitioner picks, entries a punctuator created, outer-join state migrated from Kafka Streams) and window results
+  (`emitStrategy(onWindowClose())`) that reach a node the record lanes run too, such as a Processor API node with timers,
+  released alone; `reason = final`: the shutdown's final barrier (its final flush, or punctuator runs still in progress);
+  `reason = aborted`: a pause that ended without its work (lanes not parked in time, a teardown, an overrunning
+  punctuator) — an error or warning is logged.
+  `phase = waiting_for_p`: from the first lane's park until the sub-topology's punctuation lane reached the barrier (it
+  was behind on earlier work — a long window-close pass, queued replays); `phase = work`: the work itself, from the
+  first park when the punctuation lane got there first. A pause
+  past 5 s logs one WARN naming the sub-topology, the barrier, the dominant phase and the punctuators.
+  **What an operator sees:** while one sub-topology's lanes are parked it takes no input; its lane queues fill within a
+  few hundred records, and because the dispatcher hands a batch out only when every lane it goes to has room, **the
+  whole application's input stops** — throughput drops to zero for every source at once, consumer lag grows on every
+  partition, that sub-topology's `stoatflow.lane.queue.size` sits at `stoatflow.lane.queue.capacity`, then everything
+  resumes. Diagnose with `rate(stoatflow_subtopology_exclusive_work_seconds_sum[5m])` by `sub_topology` and `phase`
+  (and `_max`) plus the WARN. **What to do:** `phase = work` → shorten the punctuators' store/timer part: do external
+  calls and heavy computation first (the free part), touch the stores last, and move long or per-key time-driven work
+  to timers (they fire on the key's lane and never pause) or record generation to a scheduled source — a punctuator
+  that scans and rewrites a large store pauses for the whole scan. `phase = waiting_for_p` → the punctuation lane is
+  slow on its own work (a window-close pass over many windows), not the punctuator. A pause past
+  `stoatflow.commit-stall.threshold-ms` (45 s) stops the app like any commit stall; a punctuator that holds a lock
+  `process()` also takes across its first store access produces exactly that — a lane blocked in `process()` never
+  parks. Frequent short pauses with `EXCLUSIVE_WORK` dominating `barrier.trigger.total` mean a punctuator touching state
+  far more often than barriers occur: it raises the commit rate.
 - `stoatflow.watermark.lag.ms` (`info`) — `now − global watermark`, sampled every second **whether or not
   the watermark advanced** (until 2026-09-03 it was written only on an advance, so it froze at a healthy
   value during exactly the stall it exists to reveal); `-1` until the first watermark. Alert on it, and
@@ -277,9 +366,14 @@ caveats: `open.files` is not published (its RocksDB ticker is gone in the bundle
   `timer_event_without_handler`, `timer_claim_behind_queue_epoch` — guard the in-flight timer registry, both
   guarantees). Otherwise unreachable by design: any increment is a StoatFlow bug — capture the ERROR (or, for
   `partition_offset_regression` and `partition_buffer_over_bound`, WARN) log line and report it (Critical).
-- `stoatflow_license_valid == 0` **`for: 10m`** — the `for` matters: every deploy reads 0 during the ~5-min
-  license `PENDING` window (Critical).
+- `stoatflow_licence_valid == 0` (Critical) and `stoatflow_licence_days_remaining < 30` (Warning) — the licence is
+  verified synchronously at start, so there is no pending window and no `for:` is needed for deploys.
+- `stoatflow_licence_services_registered > stoatflow_licence_services_cap` for a week (Warning, overage);
+  `stoatflow_licence_registry_available == 0` (Warning, status `UNVERIFIED`);
+  `stoatflow_licence_registry_broker_clock == 0` (Warning, registry on host clocks);
+  `stoatflow_licence_history_available == 0` (Warning, a gap in the usage history).
 - `max(stoatflow_consumer_lag_records) > 100000` — high lag.
+- exclusive-work pauses: `max by (sub_topology, phase) (stoatflow_subtopology_exclusive_work_seconds_max) > 5` (Warning) — one sub-topology's punctuator work or slow punctuation lane stopping the whole application's input (above).
 - watermark stall / backpressure / HA standby lag / redundancy below desired. A record stamped far in the future at a
   partition's head waits there while other partitions are backlogged; the log carries a WARN naming the partition
   ("stamped … ms in the future at its head"). With the built-in watermark strategies the partition waits but event

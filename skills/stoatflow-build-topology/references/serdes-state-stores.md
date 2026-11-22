@@ -118,7 +118,8 @@ StoatFlow type. Resolution: explicit serde on the operator config (`Consumed`/`P
   **Advice to give:** with `auto.register.schemas=false`, pre-register these like KS internal subjects; name
   repartitions (`ensure.explicit.internal.resource.naming`) so a port keeps its KS repartition and FK subjects — a
   stream–stream join's store subjects follow StoatFlow's store names (`-left-store` / `-right-store` / `-outer-store`,
-  KS `-this-join-store` / `-other-join-store` / `-outer-shared-join-store`). Lane hashing across two
+  KS `-this-join-store` / `-other-join-store` / `-outer-shared-join-store`); a named suppress's buffer is
+  `<name>-store`, Kafka Streams' name, so its subjects match. Lane hashing across two
   subjects (a timer vs its records' boundary key, the `-left` / `-right` sides of a named join) needs the registry to
   give one schema one id in every subject — Confluent and Apicurio's default content-id mode do (KS co-partitioning
   relies on the same); otherwise the timer lane-affinity guard refuses the timer. A source-backed store serializes under
@@ -184,7 +185,7 @@ persisted — enabling it is a restart. Not a config key; no KS equivalent (KS's
 end-time-first instead).
 
 **`Materialized`** (`io.stoatflow.core.topology`): `Materialized.as<K,V,StateStore>("name")`,
-`Materialized.as(StoreType.ROCKS_DB)`, `Materialized.as(supplier)` (any `Stores.*` supplier, timestamped and
+`Materialized.as(Materialized.StoreType.ROCKS_DB)` (any `DslStoreSuppliers`), `Materialized.as(supplier)` (any `Stores.*` supplier, timestamped and
 headers-aware included — `Materialized.as(Stores.persistentTimestampedKeyValueStore("counts"))` ports as is; the
 supplier overloads take two type arguments, `Materialized.as<K,V>(supplier)`, and type the store as Kafka Streams does,
 `KeyValueStore<Bytes, ByteArray>` / `WindowStore<…>` / `SessionStore<…>`), `Materialized.with(k,v)`. An operator refuses a
@@ -192,14 +193,41 @@ supplier of another store kind at topology build (a key-value one in a windowed 
 aggregation refuses a `retainDuplicates = true` window supplier (KSC-152 — Kafka Streams accepts it and emits once per
 update) and a window or session supplier it cannot use (KSC-153): a retention below its minimum — window size + grace,
 2 × time difference + grace (sliding), gap + grace (session) — or another window size (a time window's size; for sliding
-windows the time difference `D` or `D + 1`). Kafka Streams checks only `withRetention`. Options:
-`.withKeySerde`/`.withValueSerde`, `.withStoreType(StoreType.IN_MEMORY | ROCKS_DB)`, `.withRetention(d)`,
+windows the time difference `D`, Kafka Streams' size). Kafka Streams checks only `withRetention`. Options:
+`.withKeySerde`/`.withValueSerde`, `.withStoreType(Materialized.StoreType.IN_MEMORY | ROCKS_DB)`, `.withRetention(d)`,
 `.withCachingEnabled([config])`/`.withCachingDisabled()`, `.withLoggingEnabled([topicConfig])`/
 `.withLoggingDisabled()`, `.withRecordHeaders()` (KIP-1271), `.withChangelogNumPartitions(n)` (StoatFlow
 extension — no KS equivalent). Store-type precedence (Kafka Streams' order,
-KSC-100): an explicit `Materialized.as(supplier)` > `withStoreType` > RocksDB default; neither setter clears
+KSC-100): an explicit `Materialized.as(supplier)` > `withStoreType` > a `StreamsBuilder(TopologyConfig)` store type >
+the application's `dsl.store.suppliers.class` (YAML `stoatflow.dsl.store-suppliers-class`; else the deprecated
+`default.dsl.store`, honoured from the application config too — KSC-162) > RocksDB default; neither setter clears
 the other, and with both set the supplier wins with one WARN. Same per side on `StreamJoined`. A
 `Stores.*WithHeaders` supplier keeps its headers under `.withoutRecordHeaders()` (the supplier wins, one WARN).
+
+**`DslStoreSuppliers`** (`io.stoatflow.core.state`, KIP-954 — Kafka Streams' shape): `keyValueStore(DslKeyValueParams)`,
+`windowStore(DslWindowParams)`, `sessionStore(DslSessionParams)` (base supplier types) + optional `configure(Map)`.
+Params: `name()`, `dslStoreFormat()` / `storeFormat()` (`PLAIN` / `TIMESTAMPED` / `HEADERS`), `retentionPeriod()`,
+`windowSize()`, `retainDuplicates()` (`true` only for join buffers), `emitStrategy()` (`.type()` →
+`EmitStrategy.StrategyType`), `isSlidingWindow()`. Built-ins: `Materialized.StoreType.ROCKS_DB` / `IN_MEMORY` (nested,
+as in KS) and `BuiltInDslStoreSuppliers.ROCKS_DB` / `IN_MEMORY`. Return a `Stores` supplier (or delegate to a built-in)
+under `params.name()` — anything else is refused at topology build (KSC-162), a versioned supplier too (a store type
+picks a backend; a versioned table takes `Materialized.as(Stores.persistentVersionedKeyValueStore(...))`).
+Join-internal stores (outer, FK subscription) take only the backend of what it returns; the outer store's: the
+`StreamJoined`'s own store type, else the this-side supplier's backend, else the builder's or application's store type.
+Set by class name (`StreamsConfig.Builder.dslStoreSuppliersClass`, YAML), the class's `configure` gets the application's
+settings in Kafka Streams' keys, the client settings as set under `consumer.` / `producer.` / `admin.` prefixes. `new DslKeyValueParams(name, true)` means timestamped.
+
+**Store names** (KSC-159). A name is one changelog topic (`<app>-<store>-changelog`) and one state directory. Without
+`Materialized.as("name")` a store derives its name: a table's `<topic>-store`; an aggregation's, `toTable`'s, a
+materialized `filter`/`mapValues`/`transformValues`'s `<operator name>-store`; a suppress's buffer `<suppress
+name>-store` (Kafka Streams' name); a stream-stream join's `<name>-left-store` / `-right-store` / `-outer-store`.
+Derived names are StoatFlow's, not KS's generated `…-STATE-STORE-000000000N`, so `table("x")` and a suppress or `count`
+named `x` both derive `x-store`: the topology is refused at the second call, naming both sites and the setting that
+renames each (`Materialized.as`, `Suppressed.withName`, `StreamJoined.withStoreName`, `TableJoined.as`, the builder's
+name). **Reserved:** `timer-store`, `stoatflow-watermark` and names ending in `-emitfrontier`, in any letter case, are StoatFlow's own stores
+and are refused as user stores on every path — given or derived (an aggregation named `timer`, a table on topic
+`timer`), used by the app or not. **Advice:** name stateful operators' stores with `Materialized.as` (or the site's own
+setting) and never reuse those three names.
 
 **`.withChangelogNumPartitions(n)` — per-store changelog partition count** (also on `StreamJoined`, the
 Processor-API `StoreBuilder`, and `Suppressed.BufferConfig`; the unmaterialized timer store uses the
@@ -252,7 +280,10 @@ so a live store and a restored one hold the same headers; IQ and forwards see th
 every header. Never tell a user to put data in a `__stoatflow.v` or `__stoatflow.v.*` header; to keep one, rename it before the stateful
 step.
 
-Store handles: `KeyValueStore<K,V>` (`get`/`put`/`delete`, atomic `compute(key, fn)` / `merge(key, value, fn)`);
+Store handles: `KeyValueStore<K,V>` (`get`/`put`/`delete`, atomic `compute(key, fn)` / `merge(key, value, fn)` /
+`putIfAbsent(key, value)` — per key within a commit epoch, on every key-value store, headers-aware and `lruMap`
+included; `fn` runs under the store's lock, so it must be short, must never write a store, and on an `lruMap` store
+must never read another `lruMap` store — two lanes doing that in opposite order deadlock);
 **to delete a key, write `put(key, null)` unless you need the previous value** — `delete()` returns it, so it
 reads (and deserialises) it first; `put(key, null)` is the same tombstone without the read, and it is what
 both StoatFlow's DSL and Kafka Streams do internally (https://stoatflow.io/docs/building/state-stores#deleting-a-key).
@@ -275,7 +306,17 @@ WARN — the same rules apply to the window/session key-range queries (`fetch(ke
 writes per commit — EOS epoch buffering, changelog compaction) and never changes emissions — every update is forwarded
 (KSC-88). `withCachingEnabled(EmissionSuppression…)` sets a store's cache caps (past them: an early commit);
 `withCachingDisabled()` is accepted and changes nothing (default caps). There is no global caching switch.
-Consolidate with `Suppressed.untilBarrier()` / `emit.mode: on-barrier`.
+Consolidate with `Suppressed.untilBarrier()` / `emit.mode: on-barrier`: one record per key per commit, keys told apart
+by their serialized bytes (a `byte[]` key consolidates) and, with `EmitOn.CHANGE`, values compared by their serialized
+bytes — never `equals()` — under the table's serdes (else the defaults) and the topics
+of the stores holding them (a source topic when reused, else `<application.id>-<store>-changelog`): keys the table's own
+store, else the one they come from (a derived table's root store, a join's left store), values the table's own store —
+so no subject of its own, but `EmitOn.CHANGE` over a table with no store of its own serializes its values under
+`<application.id>-<node>-store-changelog` (register that `-value` subject when the serde does not register schemas
+automatically); a value the serde cannot serialize is emitted (one WARN; the rest of that commit too, then compared
+again). A key added and deleted within one commit emits nothing — except behind a join without `Materialized` (or a
+`filter`/`mapValues`/`transformValues` of one), which sends no old values: there every delete is emitted, so such a key
+sends a tombstone downstream never needed.
 Versioned `historyRetention` is retention **and** grace (older out-of-order records rejected).
 A versioned supplier in `Materialized.as(...)` makes any non-windowed key-value materialisation versioned
 (under the supplier's name): `table`/`toTable`, `KTable` `filter`/`mapValues`/`transformValues`, join results,
@@ -291,7 +332,9 @@ an **in-memory** versioned table that a join reads from another lane is refused 
 commit (an LRU store decides its own evictions, so a buffer above it is circular). Still exactly-once: an aborted
 commit always ends in an engine rebuild of the store from its changelog, so its writes never survive (with
 `withLoggingDisabled()` the rebuild is empty: every in-place ABORT restart, poison replays included, drops all its
-state). But neither can
+state). Their changelog follows them under both guarantees — each key's records are held until the commit, in the
+order the store applied the writes — so a restart restores what they held, also when two lanes wrote a key on either
+side of a commit barrier. But neither can
 be read as of the last commit. **Exactly-once reads (`KSC-126`):** under `exactly_once` every lane reads every
 other built-in store (the default KV/window/session stores, the RocksDB versioned store) as of its own commit — joins,
 Processor API reads and punctuators never see another lane's uncommitted next-commit write; IQ and `at_least_once` read
@@ -383,15 +426,26 @@ After a retention *narrowing*, existing segments keep the span they were written
 
 `io.stoatflow.core.state.KeyLockManager` is a striped lock for the rare case where one record must
 update **several keys** atomically — e.g. a transfer debiting one account and crediting another, whose
-keys live on different lanes. Construct one per processor class (`KeyLockManager()`, or
-`KeyLockManager(stripes, timeout)`) and call `withLock(key) { … }` / `withLocks(a, b) { … }`. Nesting
+keys live on different lanes. Construct one per store (`KeyLockManager()`, or
+`KeyLockManager(stripes, timeout)`) and pass that one instance to every processor instance from the supplier
+(`process({ TransferProcessor(locks) }, "accounts")`) — each lane, and the punctuator, has its own processor instance,
+so a `KeyLockManager` created in a field gives each its own locks, which exclude nothing. A key's `hashCode()` picks
+its stripe — an array's (`byte[]` too) by its content — so a key class needs a content `hashCode()`. Call
+`withLock(key) { … }` / `withLocks(a, b) { … }`. Nesting
 `withLock` throws; `withLocks` takes at most 8 keys and orders them internally, so it cannot deadlock
 against itself. From Java the vararg form compiles to an array:
 `locks.withLocks(new Object[]{ a, b }, () -> { …; return null; })`.
 
 **You almost never need it.** Records with the same key run on the same lane in arrival order, so
-per-key read-modify-write is already serial, and `compute(key, fn)` / `merge(key, value, fn)` are atomic
-for a single key.
+per-key read-modify-write is already serial, and `compute(key, fn)` / `merge(key, value, fn)` /
+`putIfAbsent(key, value)` are atomic for a single key.
+
+**From a punctuator** (ADR-154): `withLock` / `withLocks` first waits for the run's exclusive work at the next commit
+barrier — the sub-topology's record lanes are stopped there — and only then locks, so the lock is uncontended. Any
+**other** lock, semaphore or pooled resource a punctuator shares with `process()` must not be held across the
+punctuator's first store, timer or `KeyLockManager` access: a lane blocked on it in `process()` never reaches the
+barrier the punctuator waits for, and the commit-stall watchdog (`stoatflow.commit-stall.threshold-ms`, 45 s) stops
+the app, the exclusive-work WARN naming the punctuator. Take it after the first store access, or release it before.
 
 **The boundary of what any lock can do:** `compute()`/`merge()` are atomic **within a commit epoch**.
 Across a barrier rotation neither `compute()` nor a `KeyLockManager` lock is sufficient — a lane still
@@ -549,6 +603,14 @@ topic, a production handler's only when it has a sink — is checked at `start()
 one refuses the start with `MissingOutputTopicException` (KSC-148). A handler class written to set a built-in DLQ
 handler from YAML should override `deadLetterTopics()` to return its delegate's. Opt-out (clusters relying on broker
 auto-creation only): `validation.validate-output-topics: false`.
+
+**Every `CONTINUE` is counted** (Kafka Streams `dropped-records` parity), whatever the handler logs:
+`stoatflow.dropped.records.total{reason=deserialization|processing|production}`, and the dead letters it sent as
+`stoatflow.dlq.records.sent.total{source=…}`. A deserialization or production `CONTINUE` also WARNs with the
+exception, rate-limited (once a minute per partition / output topic — KS logs every one); a processing `CONTINUE` is
+logged by the handler only. Under exactly-once a production `CONTINUE` counts the source record the poison replay
+skips. The TopologyTestDriver asks all three handlers and counts the same, through the configured
+`InstrumentationCallback`.
 
 Deser + processing defaults are **fail-fast** (no silent drops unless opted in). DLQ records ride the
 **same transactional producer** (atomic on the barrier) — and only a `CONTINUE` verdict writes them:

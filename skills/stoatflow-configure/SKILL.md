@@ -1,6 +1,6 @@
 ---
 name: stoatflow-configure
-description: Configure a StoatFlow application — application.yaml (stoatflow.* / runtime.* keys), the typed StreamsConfig builder, or a Kafka Streams Properties/StreamsConfig adapter. Processing guarantee, lanes, commit barriers, state/memory/RocksDB, changelog, watermarks, HA, license, the Kafka client config merge, and the runtime HTTP/metrics/health surface. Use for StoatFlow configuration; for build/dependency setup use stoatflow-project-setup.
+description: Configure a StoatFlow application — application.yaml (stoatflow.* / runtime.* keys), the typed StreamsConfig builder, or a Kafka Streams Properties/StreamsConfig adapter. Processing guarantee, lanes, commit barriers, state/memory/RocksDB, changelog, watermarks, HA, licence, the Kafka client config merge, and the runtime HTTP/metrics/health surface. Use for StoatFlow configuration; for build/dependency setup use stoatflow-project-setup.
 license: Apache-2.0
 ---
 
@@ -34,8 +34,8 @@ stoatflow:
     dir: /var/lib/stoatflow/state
   rocks-db:
     preset: DEFAULT                        # DEFAULT | LOW_MEMORY | HIGH_PERFORMANCE
-  license:
-    key: ${STOATFLOW_LICENSE_KEY}
+  licence:
+    key: ${STOATFLOW_LICENCE_KEY}
 runtime:
   http: { enabled: true, port: ${HTTP_PORT:-8080} }
   metrics: { enabled: true }
@@ -86,8 +86,12 @@ runtime:
   `stoatflow-operate`).
 - **`stoatflow.kafka.{consumer,producer,restoration-consumer,admin}`** — freeform client passthrough (the
   user-override layer of each client's merge; see `references/ks-config-mapping.md` for the per-client layers); see `references/ks-config-mapping.md`.
-- **`stoatflow.license`** — `key`/`file`/`environment`/`cache-dir`/`verbose-banner` (see
-  `stoatflow-project-setup` for how the key is supplied).
+- **`stoatflow.licence`** — `key`/`file`/`environment`/`environment-class`/`service`/`verbose-banner`, plus `source`
+  (`configured` default | `registry`: adopt the one licence applied to the registry topic when the app configures
+  none; env `STOATFLOW_LICENCE_SOURCE`) and `registry.topic` (default `__stoatflow_licence`, history topic
+  `<topic>_history`; env `STOATFLOW_LICENCE_REGISTRY_TOPIC`) and `reporting.enabled` (daily usage report to
+  `licensing.stoatflow.io`; unset = on for a trial, off otherwise; env `STOATFLOW_LICENCE_REPORTING_ENABLED`) (see
+  `stoatflow-project-setup` for how the licence is supplied).
 - **`runtime.*`** — `http` (port 8080, `debug`), `metrics` (`prefix` `stoatflow`, `naming`
   `stoatflow|kafka-streams|both`, `common-tags`), `endpoints.info` (per-field toggles), `health`
   (broker/schema-registry timeouts).

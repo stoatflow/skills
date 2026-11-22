@@ -93,6 +93,16 @@ typical port always hits:
 - **Entry point (KSC-86):** `new KafkaStreams(topology, props)` → `StoatFlow.fromBuilder(new
   StreamsConfig(props), builder)` — pass the **builder**, not the topology. `StoatFlow.fromBuilder` is
   `@JvmStatic`. The recipe rewrites this when the builder is in the same method.
+- **Punctuators (KSC-160):** a punctuator runs on a dedicated instance of its processor, never the one `process()`
+  runs on — so it cannot see `process()`'s fields. Find and rewrite, because both compile and fail silently: a
+  buffer filled in a field by `process()` and flushed by a punctuator (→ a key-value store: put in `process()`,
+  iterate + delete in the punctuator), and a `Cancellable` kept in a field and cancelled from `process()` (→ cancel
+  inside the punctuator, or keep the decision in a store). Different processors' punctuators run in parallel (KS: one
+  after another per task) — make shared external objects thread-safe. A punctuator's store/timer work runs alone at the
+  next commit barrier and pauses its sub-topology meanwhile; keep it short, do slow I/O before it.
+- **KIP-1112 decorators (KSC-161):** a `ProcessorWrapper` decorator that forwards from `process()` of an
+  `OnWindowClose` aggregation or an `untilWindowCloses` / strict `untilTimeLimit` suppress is refused at runtime and the
+  app stops; KS allows it. Decorating and observing are fine.
 - **`processing.guarantee` default (KSC-84):** absent ⇒ StoatFlow runs **EXACTLY_ONCE** (KS: `at_least_once`).
   A ported app that relied on the KS default **silently changes semantics**. Set `at_least_once`
   explicitly if that's what you want.

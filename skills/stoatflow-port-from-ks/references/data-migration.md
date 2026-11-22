@@ -13,7 +13,7 @@ is the simpler default path.
 
 `io.stoatflow:stoatflow-migration-tool` is a **standalone offline translator CLI** — `kafka-clients` only,
 JVM 17+, a shadow fat jar, published to `maven.stoatflow.io` **only** (version-lockstep with the StoatFlow
-release you are migrating *to*), **no license gate**. It reads the KS changelog topics `read_committed`,
+release you are migrating *to*), **no licence gate**. It reads the KS changelog topics `read_committed`,
 applies per-store-type **byte-level translation** into pre-created StoatFlow changelog topics, and carries
 the input consumer-group offsets over. **The engine needs zero changes**: a first StoatFlow start over
 seeded changelogs is a forced full restore.

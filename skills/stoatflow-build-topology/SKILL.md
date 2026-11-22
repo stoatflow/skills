@@ -95,6 +95,15 @@ stream.mapValues { v -> v.length }.to("output-b")          // branch 2
   `topology.processor-api-key-affinity: presumed` to restore the boundary everywhere; or stop keying the
   store by the post-re-key key. An **injective** (1:1) re-key is safe with no boundary — StoatFlow lanes
   by the *old* key — and a node that declares a timer keeps its boundary regardless.
+- **A punctuator runs on its own instance** (KSC-160): every Processor API node has a dedicated punctuator
+  instance, so a punctuator never sees fields `process()` sets. Never write a punctuator that flushes a buffer
+  `process()` filled in a field, or a `process()` that cancels a `Cancellable` kept in a field — both fail silently;
+  keep shared state in a store. Each processor's punctuators run on a thread of their own, concurrently with records,
+  until a run first touches a connected store, a timer or a `KeyLockManager` lock; from there the run continues alone
+  at the next commit barrier with the sub-topology's input paused (under load, the whole application's). Advise
+  doing slow I/O before the first store access, keeping the store part short, and putting long or per-key
+  time-driven work in **timers** (never pause) and record generation in **scheduled sources**. Details:
+  `references/processor-api.md` → *Threading*.
 - **Every `Long` but `Long.MIN_VALUE` is an event time** (Flink is the reference; Kafka Streams refuses
   negatives). Negative times flow through windows, joins, timers and sinks — a sink writes a negative-time record
   without a timestamp, so the producer or broker stamps the wall clock (`stoatflow.sink.records.negative.timestamp.total`).
@@ -117,7 +126,14 @@ stream.mapValues { v -> v.length }.to("output-b")          // branch 2
   param (this fires on Kafka Streams too). Aggregations and the stream–table INNER join already drop
   null-key records.
 - **`Named` naming:** `Named.as("x")` (Kotlin: `` Named.`as`("x") ``, `as` is a soft keyword). Explicit
-  naming is encouraged/validated (`stoatflow.validation.ensure-explicit-naming`).
+  naming is validated by default (`stoatflow.validation.ensure-explicit-naming`, on): a generated node or store
+  name refuses the start. Each operator's own setting names it — `Consumed.as` a source (a table / global table /
+  global or read-only store: source `<n>-source`, store-writing processor `<n>`, as KS), `Produced.as`, `Grouped.as`
+  (a `groupBy`'s re-keying node too), `Repartitioned.as`, `Joined` / `StreamJoined` (node: `withName`; buffers: `as`
+  or `withStoreName`, as KS) /
+  `TableJoined`, `Branched.as`, `Printed.withName`, `Suppressed.withName`, `Materialized.as`; the refusal names each
+  site's setting. Nodes no setting can name (an unnamed table's processor, a join's halves, `groupBy`'s change record)
+  are not checked. `StreamsBuilder(TopologyConfig)` whose config sets the key checks at `build()`, as KS.
 
 ## See also
 

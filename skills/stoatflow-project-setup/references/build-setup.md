@@ -1,7 +1,8 @@
 # Build setup — Gradle & Maven (complete snippets)
 
 StoatFlow resolves from `https://maven.stoatflow.io/releases` only. Username form `customer-<your-slug>`;
-token from your onboarding email. Keep `mavenCentral()` for third-party deps.
+token from your onboarding email (no credentials yet? a free trial at `https://stoatflow.io/trial` mails the
+token with the licence). Keep `mavenCentral()` for third-party deps.
 
 ## Gradle
 

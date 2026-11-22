@@ -1,6 +1,6 @@
 ---
 name: stoatflow-project-setup
-description: Set up a project that uses StoatFlow — Gradle or Maven build, the dependency coordinates, the PRIVATE StoatFlow Maven repository (maven.stoatflow.io) and its credentials, the license key, JDK 25 or newer and the JVM flags, the io.stoatflow Gradle plugin / Maven parent+BOM+plugin, Docker (Jib), and GraalVM native image. Use for build/dependency/repo wiring; for application config keys use stoatflow-configure.
+description: Set up a project that uses StoatFlow — Gradle or Maven build, the dependency coordinates, the PRIVATE StoatFlow Maven repository (maven.stoatflow.io) and its credentials, the licence, JDK 25 or newer and the JVM flags, the io.stoatflow Gradle plugin / Maven parent+BOM+plugin, Docker (Jib), and GraalVM native image. Use for build/dependency/repo wiring; for application config keys use stoatflow-configure.
 license: Apache-2.0
 ---
 
@@ -60,16 +60,28 @@ deps), credentials in `~/.m2/settings.xml` (`<server id="stoatflow-releases">`),
 a property there). Config knobs go in `<properties>` (`stoatflow.mainClass`, `stoatflow.docker.*`,
 `stoatflow.nativeImage.*`); profiles activate with `-P`, not `<properties>`.
 
-## License key
+## Licence
 
-Set **`STOATFLOW_LICENSE_KEY`** (value starts `key/…`, from your onboarding email; a free trial key is requested at
-`https://stoatflow.io/contact`, a commercial one from `sales@stoatflow.io`). Precedence: env var >
-`-D` system property > `application.yaml` (`stoatflow.license.key`). In `application.yaml`, interpolate to
-keep the literal out of VCS: `key: ${STOATFLOW_LICENSE_KEY}`. **Production and Trial deployments require
-`STOATFLOW_LICENSE_ENVIRONMENT`** explicitly — e.g. `prod`, `staging`; in Kubernetes the auto-generated hostname
-is the pod name, so every redeploy would count as a new instance (a Developer key on a laptop auto-derives
-`<user>-<host>`; GitHub Actions auto-derives `cicd-<run id>`). One `application.id` + environment is one licensed
-instance; replicas and an HA pair count once. Deferred validation means short-lived test/CI instances never count.
+StoatFlow verifies a signed licence **offline** at `start()` — no licence server, no network access. Set
+**`STOATFLOW_LICENCE_KEY`** (value starts `sfl1.`, from your onboarding email; a free 30-day trial starts at
+`https://stoatflow.io/trial` — the licence and the Maven token arrive together by email, nothing is shown on
+screen — and a commercial licence comes from `sales@stoatflow.io`). Precedence: env var >
+`-D` system property > `application.yaml` (`stoatflow.licence.key`); else a file (`STOATFLOW_LICENCE_FILE`,
+default `~/.stoatflow/licence.key`, chmod 600; only a root-owned mount, such as a Kubernetes Secret with `fsGroup` and `defaultMode: 0440`, may also be group-readable). An explicit key always beats a file. In `application.yaml`,
+interpolate to keep the literal out of VCS: `key: ${STOATFLOW_LICENCE_KEY}`. Note the British spelling:
+`STOATFLOW_LICENSE_*` is not read.
+
+Each deployment declares an **environment class** (`STOATFLOW_LICENCE_ENVIRONMENT_CLASS`): `production` (the
+default), `staging`, `development` or `other`. The licence prices the classes it lists; unlisted classes are
+free, and a developer licence refuses `production`. **Production, enterprise and trial licences require
+`STOATFLOW_LICENCE_ENVIRONMENT`** explicitly — e.g. `prd-eu`, `stg`; in Kubernetes the auto-generated hostname is
+the pod name, which changes every redeploy (developer and internal licences default it to `<user>-<host>`, or
+`cicd-<run id>` on GitHub Actions). Local development: developer licence plus
+`STOATFLOW_LICENCE_ENVIRONMENT_CLASS=development`; CI: any licence plus `STOATFLOW_LICENCE_ENVIRONMENT_CLASS=other` (and a stable `STOATFLOW_LICENCE_ENVIRONMENT`, e.g. `ci`, when the licence lists `other` or `*`, which counts the class).
+Refusals throw `io.stoatflow.core.exception.LicenceValidationException` from `start()` with a `code`. Details:
+https://stoatflow.io/docs/getting-started/licence-configuration. The licence tool — verify a licence offline, apply a
+renewal to a cluster without a restart, usage reports — is the fat jar
+`io.stoatflow:stoatflow-licence-tool:<version>:all` from the same repository (JDK 25+; how-to in stoatflow-operate).
 
 ## JDK & flags
 
